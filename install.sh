@@ -32,9 +32,7 @@ install_bot() {
     echo -e "${YELLOW}>>> 开始安装流程...${NC}"
 
     echo -e "${YELLOW}正在检查环境依赖...${NC}"
-    if [ ! -f "/var/lib/apt/lists/lock" ]; then
-        apt-get update -y
-    fi
+    apt-get update -y
     if ! command -v python3 &> /dev/null; then
         echo -e "${YELLOW}未检测到 Python3，正在安装...${NC}"
         apt-get install -y python3
@@ -45,7 +43,7 @@ install_bot() {
     fi
 
     echo -e "${YELLOW}正在安装/更新 Python 依赖...${NC}"
-    pip3 install python-telegram-bot[job-queue] httpx qrcode[pil] fastapi uvicorn --break-system-packages
+    pip3 install python-telegram-bot[job-queue] httpx qrcode[pil] --break-system-packages
 
     if [ ! -d "$WORK_DIR" ]; then
         mkdir -p "$WORK_DIR"
@@ -53,19 +51,7 @@ install_bot() {
     fi
 
     echo -e "${YELLOW}正在拉取最新代码...${NC}"
-    mkdir -p "$WORK_DIR/services" "$WORK_DIR/storage" "$WORK_DIR/utils" "$WORK_DIR/handlers" "$WORK_DIR/jobs" "$WORK_DIR/web_admin"
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/bot.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bot.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/services/orders.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/services/orders.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/services/panel_api.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/services/panel_api.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/storage/db.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/storage/db.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/utils/formatting.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/utils/formatting.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/handlers/bulk_actions.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/handlers/bulk_actions.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/handlers/admin.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/handlers/admin.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/handlers/client.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/handlers/client.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/jobs/anomaly.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/jobs/anomaly.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/jobs/expiry.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/jobs/expiry.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/web_admin/__init__.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/web_admin/__init__.py
-    curl -fL --retry 3 --connect-timeout 10 -o "$WORK_DIR/web_admin/app.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/web_admin/app.py
+    curl -fL --retry 3 --retry-delay 2 -o "$WORK_DIR/bot.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bot.py
 
     chmod +x "$WORK_DIR/bot.py"
     echo -e "${GREEN}代码文件同步完成。${NC}"

@@ -2,151 +2,109 @@
 
 当前版本：`V3.5`
 
+RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 订阅售卖与管理机器人。
+当前仓库主程序仍为单文件 `bot.py`（已可直接部署运行），并包含一组后续重构用的模块目录（`services/`、`storage/`、`handlers/`、`jobs/`、`utils/`）。
 
-
-当前版本：`V3.7`
-
----
-
-## ✨ 功能总览
-
-### 👤 用户端
-- 套餐购买 / 续费下单
-- 订阅信息查看（流量、到期、订阅链接、二维码）
-- 节点状态查看
-- 联系客服（支持文字/图片/文件转发）
-
-### 👮 管理端
-- 套餐管理（新增/删除 + 流量重置策略）
-- 用户管理（重置流量、删除用户、查看请求记录）
-- 订单审计（待审核 / 处理中 / 已拒绝 / 已发货 / 失败）
-- 失败订单一键重试发货
-- 异常检测（可解释告警：风险评分 + 命中证据）
-- 异常白名单管理（支持告警消息内快捷加入）
-- 订阅设置可视化后台（在 TG 直接查看与JSON更新）
-- 用户分组运营（分组列表、可访问节点、批量迁移）
-- 带宽看板（TOP节点与请求趋势）
-- 风控策略多级化（低：告警 / 中：限速 / 高：禁用）
-- 风控回溯面板（记录用户、等级、分数、动作与证据摘要）
-- 订阅设置模板与回滚点（模板一键应用、最近快照回滚）
-- 分组容量统计与一键迁移建议（基于样本负载自动建议）
-- 带宽看板增强（TOP用户流量 + 节点波动提醒）
-- 风控观察名单 + 自动解封（中风险限速后可按时自动恢复）
-- 操作时间线（订单审计 + 风控回溯 + 配置操作统一视图）
-- 模板中心（内置模板 + 自定义模板保存/复用）
-- 批量任务队列（提交→排队→后台执行→结果可追踪）
-- 风控灰度执行模式（enforce/gray/observe 一键切换）
-- 渠道化追踪（支持 `/start 渠道码` 记录订单来源）
-- 批量用户操作（带预检查确认）
-  - 批量重置流量
-  - 批量禁用
-  - 批量删除
-  - 批量修改到期时间
-  - 批量修改流量包
-
-### 🎨 交互与美化
-- 管理员首页展示今日订单/待审核/失败统计
-- 订单审计列表中文状态图标化展示
-- 订单审计支持分页浏览（上一页 / 下一页）
-- 管理按钮与菜单命名全部中文化
-- 用户购买流程增加步骤提示（选套餐→选支付方式→提交凭证）
+> 说明：当前版本不包含独立 Web 管理台，也未内置 Telegram Mini App 前端。
 
 ---
 
-## 🧱 项目结构
-- `bot.py`：主入口与核心路由
-- `services/panel_api.py`：面板接口请求（连接复用 + 重试）
-- `services/orders.py`：订单状态机与审计能力
-- `storage/db.py`：SQLite 初始化与访问
-- `handlers/admin.py`：管理端文案渲染与中文状态映射
-- `handlers/client.py`：用户端展示渲染
-- `handlers/bulk_actions.py`：批量操作解析、分批执行、预检查
-- `jobs/anomaly.py`：异常评分与证据生成
-- `jobs/expiry.py`：到期提醒节流工具
-- `utils/formatting.py`：MarkdownV2 转义
+## 功能概览
+
+### 用户端
+- 购买新订阅（选择套餐后提交付款信息）。
+- 查看我的订阅/续费。
+- 展示订阅链接二维码。
+- 查看节点在线状态。
+- 联系客服（向管理员发送消息）。
+
+### 管理端
+- 套餐管理（增删套餐、查看详情）。
+- 用户与订阅管理（查看、删除、重置流量、修改重置策略）。
+- 到期提醒与自动清理设置。
+- 异常检测阈值与检测周期设置。
 
 ---
 
+## 环境要求
 
-## 🛠 环境要求
-- Debian / Ubuntu VPS
-- Python 3.9+
-- 可访问 Remnawave Panel API
-- Telegram 机器人令牌
+- Debian / Ubuntu VPS（推荐）。
+- Python 3.9+。
+- 可访问的 Remnawave 面板。
+- Telegram Bot Token（@BotFather）。
+- 管理员 Telegram ID。
 
 ---
 
-## 🚀 一键安装 / 更新
+## 一键安装 / 更新
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/install.sh)
 ```
 
-安装脚本会自动完成：
-1. 安装 Python 与依赖
-2. 同步 `bot.py` 与 `services/ storage/ handlers/ jobs/ utils/` 代码
-3. 首次仅生成机器人基础配置（管理员ID + Bot Token）
-4. 配置并启动 `remnashop` 系统服务
-
-> 面板地址、面板Token、订阅域名、默认组UUID 现已改为在机器人管理菜单 **「🔌 面板配置」** 内配置。
+安装脚本会：
+1. 安装 Python 与依赖。
+2. 拉取 `bot.py` 到 `/opt/RemnaShop`。
+3. 首次生成 `config.json`。
+4. 创建并启动 `remnashop.service`（systemd）。
 
 ---
 
-## 🌐 Telegram + Web 管理台并存
+## 配置文件
 
-从 V3.7 开始支持与 Telegram 机器人并存的 Web 管理台（FastAPI）：
+路径：`/opt/RemnaShop/config.json`
 
-- 默认地址：`http://服务器IP:8787/docs`
-- 默认服务名：`remnashop-web`
-- 认证方式：请求头 `X-Admin-Token`
-- 在机器人管理菜单「🔌 面板配置」中设置 `Web管理台地址` 后，管理员首页会出现「🌐 Telegram内置 Web 管理台」按钮
+示例：
 
-首次启动 Web 管理台时，如果 `config.json` 中 `admin_web_token` 为空，会自动生成并写回配置。
-
-示例（查看订单列表）：
-
-```bash
-curl -H "X-Admin-Token: 你的admin_web_token" \
-  http://127.0.0.1:8787/api/orders
+```json
+{
+  "admin_id": "123456789",
+  "bot_token": "123456:ABCDEF",
+  "panel_url": "https://panel.example.com",
+  "panel_token": "your_panel_api_token",
+  "sub_domain": "https://sub.example.com",
+  "group_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+}
 ```
 
 ---
 
+## 目录说明（按当前仓库实际）
 
-## ⚙️ 配置文件
-默认路径：`/opt/RemnaShop/config.json`
-
-关键字段：
-- `admin_id`（管理员 Telegram ID）
-- `bot_token`（机器人令牌）
-- `panel_url`（面板地址，可在机器人「🔌 面板配置」填写）
-- `panel_token`（面板接口令牌，可在机器人「🔌 面板配置」填写）
-- `sub_domain`（订阅域名，可在机器人「🔌 面板配置」填写）
-- `group_uuid`（默认用户组 UUID，可在机器人「🔌 面板配置」填写）
-- `panel_verify_tls`（是否校验面板 HTTPS 证书，可在机器人「🔌 面板配置」切换）
-- `admin_web_token`（Web 管理台认证令牌，HTTP 请求头使用 `X-Admin-Token`）
-- `web_admin_url`（Telegram 内置 Web 管理台地址，可在机器人「🔌 面板配置」中设置）
+- `bot.py`：当前生产主程序入口。
+- `install.sh`：安装/更新/卸载脚本。
+- `services/`、`storage/`、`handlers/`、`jobs/`、`utils/`：预留与重构相关代码目录（当前主流程主要在 `bot.py` 中）。
+- `CODE_REVIEW.md`：历史代码审查记录。
 
 ---
+
+## 常用运维命令
 
 ## 🔧 运维命令
 ```bash
 # 查看日志
 journalctl -u remnashop -f
 
-# 重启服务
+# 重启
 systemctl restart remnashop
 
-# 查看状态
+# 停止
+systemctl stop remnashop
+
+# 开机自启状态
 systemctl status remnashop
 ```
 
 ---
 
-## 📞 联系与支持
-* **作者**：ike
-* **交流群组**：[点击加入 Remnawave 中文交流群](https://t.me/Remnawarecn)
 
 ---
 
-*本项目仅供学习交流使用，请遵守当地法律法规。*
+## 联系与支持
+
+- 作者：ike
+- 交流群组：https://t.me/Remnawarecn
+
+---
+
+本项目仅供学习交流使用，请遵守当地法律法规。
