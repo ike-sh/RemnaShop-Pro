@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # 定义颜色
 GREEN='\033[0;32m'
@@ -17,7 +18,7 @@ fi
 show_menu() {
     clear
     echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN}        RemnaShop-Pro 管理脚本 V2.4          ${NC}"
+    echo -e "${GREEN}        RemnaShop-Pro 管理脚本 V3.5          ${NC}"
     echo -e "${GREEN}=============================================${NC}"
     echo -e "1. 🛠  安装 / 更新 (保留数据库)"
     echo -e "2. 🗑  卸载全部 (删除数据)"
@@ -30,9 +31,7 @@ install_bot() {
     echo -e "${YELLOW}>>> 开始安装流程...${NC}"
 
     echo -e "${YELLOW}正在检查环境依赖...${NC}"
-    if [ ! -f "/var/lib/apt/lists/lock" ]; then
-        apt-get update -y
-    fi
+    apt-get update -y
     if ! command -v python3 &> /dev/null; then
         echo -e "${YELLOW}未检测到 Python3，正在安装...${NC}"
         apt-get install -y python3
@@ -43,7 +42,7 @@ install_bot() {
     fi
 
     echo -e "${YELLOW}正在安装/更新 Python 依赖...${NC}"
-    pip3 install python-telegram-bot[job-queue] requests httpx qrcode[pil] --break-system-packages
+    pip3 install python-telegram-bot[job-queue] httpx qrcode[pil] --break-system-packages
 
     if [ ! -d "$WORK_DIR" ]; then
         mkdir -p "$WORK_DIR"
@@ -51,7 +50,7 @@ install_bot() {
     fi
 
     echo -e "${YELLOW}正在拉取最新代码...${NC}"
-    curl -o $WORK_DIR/bot.py https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bot.py
+    curl -fL --retry 3 --retry-delay 2 -o "$WORK_DIR/bot.py" https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bot.py
 
     chmod +x "$WORK_DIR/bot.py"
     echo -e "${GREEN}已赋予脚本执行权限。${NC}"
