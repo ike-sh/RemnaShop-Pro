@@ -726,10 +726,13 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
     qr_file_id = get_setting_value(qr_key)
 
     if payment_method == "alipay":
-        alipay_mode = get_setting_value("alipay_collect_mode", "token")
-        pay_tip = "请在此直接发送 **支付宝口令红包** (文字) 给机器人。" if alipay_mode == "token" else "请根据下方支付宝收款码完成付款后，发送 **支付截图/备注** 给机器人。"
+        raw_mode = str(get_setting_value("alipay_collect_mode", "token") or "token").strip().lower()
+        alipay_mode = "qr" if raw_mode in {"qr", "qrcode", "code", "扫码", "收款码"} else "token"
+        pay_tip = "请在下方直接发送 **支付宝口令红包**（文字）给机器人。" if alipay_mode == "token" else "请按下方支付宝收款码完成付款后，发送 **支付截图/备注** 给机器人。"
+        should_send_qr = alipay_mode == "qr"
     else:
-        pay_tip = "请根据下方微信收款码完成付款后，发送 **支付截图/备注** 给机器人。"
+        pay_tip = "请按下方微信收款码完成付款后，发送 **支付截图/备注** 给机器人。"
+        should_send_qr = True
 
     msg = (
         f"📝 **订单确认 ({type_str})**\n"
@@ -737,10 +740,34 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
         f"💰 金额：**{plan_dict['price']}**\n"
         f"📡 流量：**{plan_dict['gb']} GB ({strategy_label})**\n"
         f"💳 支付方式：**{method_label}**\n\n"
-        f"💳 **下一步：**\n{pay_tip}\n👇 👇 👇"
+        f"💳 **下一步：**\n{pay_tip}"
     )
     if not created:
         msg = "⚠️ 你已有一个待审核订单，请先等待管理员处理，或取消后重新下单。"
+        await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(keyboard))
+        return
+
+    if should_send_qr and qr_file_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=qr_file_id,
+                caption=f"{msg}\n\n👇 请按提示完成支付后提交凭证。",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            if update.callback_query and update.callback_query.message:
+                try:
+                    await update.callback_query.message.delete()
+                except Exception:
+                    pass
+            return
+        except Exception as exc:
+            logger.warning("发送收款码失败: %s", exc)
+            msg += "\n\n⚠️ 当前收款码未能发送，请联系管理员。"
+    elif should_send_qr and not qr_file_id:
+        msg += "\n\n⚠️ 管理员暂未配置该支付方式收款码，请联系管理员。"
+
     await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(keyboard))
     if created and qr_file_id:
         try:
@@ -958,28 +985,31 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "admin_pay_settings":
         ali = "已配置" if get_setting_value("alipay_qr_file_id") else "未配置"
         wx = "已配置" if get_setting_value("wechat_qr_file_id") else "未配置"
-        alipay_mode = get_setting_value("alipay_collect_mode", "token")
+        raw_mode = str(get_setting_value("alipay_collect_mode", "token") or "token").strip().lower()
+        alipay_mode = "qr" if raw_mode in {"qr", "qrcode", "code", "扫码", "收款码"} else "token"
         mode_label = "支付宝口令收款" if alipay_mode == "token" else "支付宝收款码收款"
         msg = (
             "💳 **收款设置**\n"
             f"🟦 支付宝收款码：{ali}\n"
             f"🟩 微信收款码：{wx}\n"
             f"🧾 支付宝收款模式：{mode_label}\n\n"
-            "可切换支付宝收款模式，并上传对应收款图片。"
+            "支付宝收款统一在一个模式里切换：口令收款 或 收款码收款。"
         )
         kb = [
-            [InlineKeyboardButton("支付宝口令收款", callback_data="set_alipay_mode_token"), InlineKeyboardButton("支付宝收款码收款", callback_data="set_alipay_mode_qr")],
+            [InlineKeyboardButton(f"🔁 切换支付宝模式（当前：{mode_label}）", callback_data="set_alipay_mode_toggle")],
             [InlineKeyboardButton("上传支付宝收款码", callback_data="set_payimg_alipay")],
             [InlineKeyboardButton("上传微信收款码", callback_data="set_payimg_wechat")],
             [InlineKeyboardButton("🔙 返回", callback_data="back_home")],
         ]
         await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
         return
-    if data in {"set_alipay_mode_token", "set_alipay_mode_qr"}:
-        mode = "token" if data.endswith("token") else "qr"
-        set_setting_value("alipay_collect_mode", mode)
-        await query.answer("✅ 已更新支付宝收款模式", show_alert=True)
-        await send_or_edit_menu(update, context, "✅ 支付宝收款模式已更新。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_pay_settings")]]))
+    if data == "set_alipay_mode_toggle":
+        current_raw = str(get_setting_value("alipay_collect_mode", "token") or "token").strip().lower()
+        current_mode = "qr" if current_raw in {"qr", "qrcode", "code", "扫码", "收款码"} else "token"
+        next_mode = "qr" if current_mode == "token" else "token"
+        set_setting_value("alipay_collect_mode", next_mode)
+        await query.answer(f"✅ 已切换为{'支付宝收款码收款' if next_mode == 'qr' else '支付宝口令收款'}", show_alert=True)
+        await send_or_edit_menu(update, context, "✅ 支付宝收款模式已更新。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回收款设置", callback_data="admin_pay_settings")]]))
         return
 
     if data in {"set_payimg_alipay", "set_payimg_wechat"}:
@@ -2276,7 +2306,7 @@ if __name__ == '__main__':
     except Exception as exc:
         logger.warning("Failed to reschedule anomaly job at startup: %s", exc)
 
-    print(f"🚀 RemnaShop-Pro V3.1 已启动 | 监听中...")
+    print(f"🚀 RemnaShop-Pro V3.2 已启动 | 监听中...")
     try:
         app.run_polling()
     finally:
