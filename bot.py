@@ -997,6 +997,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         kb = [
             [InlineKeyboardButton(f"🔁 切换支付宝模式（当前：{mode_label}）", callback_data="set_alipay_mode_toggle")],
+            [InlineKeyboardButton("🧪 支付设置自检", callback_data="admin_pay_self_check")],
             [InlineKeyboardButton("上传支付宝收款码", callback_data="set_payimg_alipay")],
             [InlineKeyboardButton("上传微信收款码", callback_data="set_payimg_wechat")],
             [InlineKeyboardButton("🔙 返回", callback_data="back_home")],
@@ -1010,6 +1011,50 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         set_setting_value("alipay_collect_mode", next_mode)
         await query.answer(f"✅ 已切换为{'支付宝收款码收款' if next_mode == 'qr' else '支付宝口令收款'}", show_alert=True)
         await send_or_edit_menu(update, context, "✅ 支付宝收款模式已更新。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回收款设置", callback_data="admin_pay_settings")]]))
+        return
+
+    if data == "admin_pay_self_check":
+        alipay_qr_ready = bool(get_setting_value("alipay_qr_file_id"))
+        wechat_qr_ready = bool(get_setting_value("wechat_qr_file_id"))
+        current_raw = str(get_setting_value("alipay_collect_mode", "token") or "token").strip().lower()
+        alipay_mode = "qr" if current_raw in {"qr", "qrcode", "code", "扫码", "收款码"} else "token"
+
+        alipay_mode_label = "支付宝口令收款" if alipay_mode == "token" else "支付宝收款码收款"
+        alipay_client_hint = (
+            "客户端将展示：发送支付宝口令红包文字给机器人（无需图片）"
+            if alipay_mode == "token"
+            else "客户端将展示：支付宝二维码图片 + 付款凭证提交提示"
+        )
+        wechat_client_hint = "客户端将展示：微信二维码图片 + 付款凭证提交提示"
+
+        checks = [
+            ("支付宝模式", f"✅ {alipay_mode_label}"),
+            ("支付宝二维码", "✅ 已配置" if alipay_qr_ready else "⚠️ 未配置"),
+            ("微信二维码", "✅ 已配置" if wechat_qr_ready else "⚠️ 未配置"),
+            ("客户端-支付宝", alipay_client_hint),
+            ("客户端-微信", wechat_client_hint),
+        ]
+
+        suggestions = []
+        if alipay_mode == "qr" and not alipay_qr_ready:
+            suggestions.append("支付宝当前为收款码模式，但未上传支付宝收款码。")
+        if not wechat_qr_ready:
+            suggestions.append("微信支付入口已开放，建议上传微信收款码，避免用户无法完成支付。")
+
+        lines = ["🧪 **支付设置自检报告**", ""]
+        for name, result in checks:
+            lines.append(f"• {name}：{result}")
+        if suggestions:
+            lines.extend(["", "🔧 建议修复："])
+            lines.extend([f"- {x}" for x in suggestions])
+        else:
+            lines.extend(["", "🎉 配置检查通过，支付流程可正常使用。"])
+
+        kb = [
+            [InlineKeyboardButton("🔙 返回收款设置", callback_data="admin_pay_settings")],
+            [InlineKeyboardButton("🏠 返回主页", callback_data="back_home")],
+        ]
+        await send_or_edit_menu(update, context, "\n".join(lines), InlineKeyboardMarkup(kb))
         return
 
     if data in {"set_payimg_alipay", "set_payimg_wechat"}:
@@ -2272,6 +2317,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^reset_traffic_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^set_strategy_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^set_payimg_"))
+    app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^set_alipay_mode_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^reply_user_")) 
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^set_anomaly_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^admin_orders_"))
