@@ -80,6 +80,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main
 
 ## 常用运维命令
 
+## 🔧 运维命令
 ```bash
 # 查看日志
 journalctl -u remnashop -f
@@ -96,13 +97,6 @@ systemctl status remnashop
 
 ---
 
-## 已知现状与后续优化建议
-
-- 当前业务逻辑集中在 `bot.py`，后续可逐步迁移到模块目录并补充测试。
-- 建议优先补充：
-  - 订单与支付流程回归测试；
-  - 配置项合法性校验；
-  - 关键回调路径的日志埋点与异常分级。
 
 ---
 
