@@ -5,8 +5,6 @@
 RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 订阅售卖与管理机器人。
 当前仓库主程序仍为单文件 `bot.py`（已可直接部署运行），并包含一组后续重构用的模块目录（`services/`、`storage/`、`handlers/`、`jobs/`、`utils/`）。
 
-> 说明：当前版本不包含独立 Web 管理台，也未内置 Telegram Mini App 前端。
-
 ---
 
 ## 功能概览
