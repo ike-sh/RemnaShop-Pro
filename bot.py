@@ -902,6 +902,11 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
 
     msg += "\n\n👇 请先发送支付凭证，再点击“完成支付并上传支付凭证”。"
     await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(keyboard))
+    if created and qr_file_id:
+        try:
+            await context.bot.send_photo(chat_id=user_id, photo=qr_file_id, caption=f"📌 当前收款码：{method_label}")
+        except Exception as exc:
+            logger.warning("发送收款码失败: %s", exc)
 
 async def show_plans_menu(update, context):
     plans = db_query("SELECT * FROM plans")
