@@ -2,57 +2,57 @@
 
 当前版本：`V3.5`
 
-RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 订阅售卖与管理机器人。
-当前仓库主程序仍为单文件 `bot.py`（已可直接部署运行），并包含一组后续重构用的模块目录（`services/`、`storage/`、`handlers/`、`jobs/`、`utils/`）。
-
-> 说明：当前版本不包含独立 Web 管理台，也未内置 Telegram Mini App 前端。
+RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 机器人，提供订阅售卖、续费、状态查询与基础运维能力。
 
 ---
 
-## 功能概览
+## 功能
 
 ### 用户端
-- 购买新订阅（选择套餐后提交付款信息）。
-- 查看我的订阅/续费。
-- 展示订阅链接二维码。
-- 查看节点在线状态。
-- 联系客服（向管理员发送消息）。
+- 购买新订阅（选择套餐并提交付款信息）。
+- 我的订阅 / 续费。
+- 订阅详情查看（到期时间、状态、流量使用）。
+- 订阅链接二维码生成。
+- 节点状态查询。
+- 联系客服。
 
 ### 管理端
-- 套餐管理（增删套餐、查看详情）。
-- 用户与订阅管理（查看、删除、重置流量、修改重置策略）。
-- 到期提醒与自动清理设置。
+- 套餐管理（新增、查看、删除）。
+- 用户列表与订阅管理（查看、删除、重置流量、重置策略）。
+- 订单审核（通过 / 拒绝）。
+- 到期提醒天数设置。
+- 过期清理天数设置。
 - 异常检测阈值与检测周期设置。
 
 ---
 
-## 环境要求
+## 运行环境
 
-- Debian / Ubuntu VPS（推荐）。
-- Python 3.9+。
-- 可访问的 Remnawave 面板。
-- Telegram Bot Token（@BotFather）。
-- 管理员 Telegram ID。
+- Debian / Ubuntu（推荐）
+- Python 3.9+
+- 已部署 Remnawave 面板
+- Telegram Bot Token
+- Telegram 管理员 ID
 
 ---
 
-## 一键安装 / 更新
+## 安装
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/install.sh)
 ```
 
-安装脚本会：
-1. 安装 Python 与依赖。
-2. 拉取 `bot.py` 到 `/opt/RemnaShop`。
-3. 首次生成 `config.json`。
-4. 创建并启动 `remnashop.service`（systemd）。
+安装脚本功能：
+1. 安装 Python 与依赖包。
+2. 同步项目代码到 `/opt/RemnaShop`。
+3. 首次创建 `config.json`。
+4. 创建并启动 `remnashop.service`。
 
 ---
 
 ## 配置文件
 
-路径：`/opt/RemnaShop/config.json`
+配置文件路径：`/opt/RemnaShop/config.json`
 
 示例：
 
@@ -69,48 +69,41 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main
 
 ---
 
-## 目录说明（按当前仓库实际）
+## 项目结构
 
-- `bot.py`：当前生产主程序入口。
-- `install.sh`：安装/更新/卸载脚本。
-- `services/`、`storage/`、`handlers/`、`jobs/`、`utils/`：预留与重构相关代码目录（当前主流程主要在 `bot.py` 中）。
-- `CODE_REVIEW.md`：历史代码审查记录。
+- `bot.py`：主程序入口
+- `install.sh`：安装/更新/卸载脚本
+- `handlers/`：消息与回调处理辅助代码
+- `services/`：面板 API、订单相关服务代码
+- `storage/`：数据库初始化与访问辅助代码
+- `jobs/`：定时任务辅助代码
+- `utils/`：通用工具函数
 
 ---
 
-## 常用运维命令
+## 常用命令
 
 ## 🔧 运维命令
 ```bash
 # 查看日志
 journalctl -u remnashop -f
 
-# 重启
+# 重启服务
 systemctl restart remnashop
 
-# 停止
+# 停止服务
 systemctl stop remnashop
 
-# 开机自启状态
+# 查看服务状态
 systemctl status remnashop
 ```
 
 ---
 
-## 已知现状与后续优化建议
-
-- 当前业务逻辑集中在 `bot.py`，后续可逐步迁移到模块目录并补充测试。
-- 建议优先补充：
-  - 订单与支付流程回归测试；
-  - 配置项合法性校验；
-  - 关键回调路径的日志埋点与异常分级。
-
----
-
-## 联系与支持
+## 联系
 
 - 作者：ike
-- 交流群组：https://t.me/Remnawarecn
+- 群组：https://t.me/Remnawarecn
 
 ---
 
