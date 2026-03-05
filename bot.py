@@ -1044,19 +1044,27 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    # 只要离开“回复输入模式”，就清理回复上下文，避免串场
+    if not data.startswith("reply_user_"):
+        context.user_data.pop('reply_to_uid', None)
+        context.user_data.pop('reply_back_cb', None)
     
     if data == "back_home":
         await start(update, context)
         return
 
     if data.startswith("reply_user_"):
-        parts = data.split("_")
-        target_uid = int(parts[2])
-        context.user_data["reply_to_uid"] = target_uid
-        if len(parts) >= 4:
-            context.user_data["reply_return_order_id"] = parts[3]
-        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消回复", callback_data="cancel_op")]])
-        await query.message.reply_text(f"✍️ 请输入回复给用户 `{target_uid}` 的内容 (文字/图片)：", parse_mode="Markdown", reply_markup=cancel_kb)
+        raw = data.replace("reply_user_", "", 1)
+        if "_" in raw:
+            uid_part, back_cb = raw.split("_", 1)
+        else:
+            uid_part, back_cb = raw, "back_home"
+        target_uid = int(uid_part)
+        context.user_data['reply_to_uid'] = target_uid
+        context.user_data['reply_back_cb'] = back_cb
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回上一页", callback_data=back_cb)]])
+        await query.message.reply_text(f"✍️ 请输入回复给用户 `{target_uid}` 的内容 (文字/图片)：", parse_mode='Markdown', reply_markup=cancel_kb)
         return
     if data == "cancel_op":
         context.user_data.clear()
@@ -1930,21 +1938,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if user_id == ADMIN_ID and 'reply_to_uid' in context.user_data:
         target_uid = context.user_data['reply_to_uid']
+        back_cb = context.user_data.get('reply_back_cb', 'back_home')
         try:
             await context.bot.copy_message(chat_id=target_uid, from_chat_id=user_id, message_id=update.message.message_id)
             await context.bot.send_message(target_uid, "👆 **(来自客服的回复)**", parse_mode='Markdown')
-            order_id = context.user_data.get("reply_return_order_id")
-            back_cb = f"admin_order_{order_id}" if order_id else "back_home"
             admin_done_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回上一页", callback_data=back_cb)]])
             await update.message.reply_text("✅ 回复已送达！", reply_markup=admin_done_kb)
         except Exception as e:
             await update.message.reply_text(f"❌ 发送失败：{e}")
         del context.user_data['reply_to_uid']
-        context.user_data.pop("reply_return_order_id", None)
+        context.user_data.pop('reply_back_cb', None)
         return
     if context.user_data.get('chat_mode') == 'support':
         admin_header = f"📨 **新客服消息**\n来自：{update.effective_user.mention_html()} (`{user_id}`)"
-        reply_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ 回复此用户", callback_data=f"reply_user_{user_id}_{pending_order['order_id']}")]])
+        reply_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ 回复此用户", callback_data=f"reply_user_{user_id}_back_home")]])
         await context.bot.send_message(ADMIN_ID, admin_header, reply_markup=reply_kb, parse_mode='HTML')
         await context.bot.copy_message(chat_id=ADMIN_ID, from_chat_id=user_id, message_id=update.message.message_id)
         await update.message.reply_text("✅ 已转发")
@@ -2065,35 +2072,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [[InlineKeyboardButton("🚫 永不重置", callback_data="set_strategy_NO_RESET")], [InlineKeyboardButton("📅 每日重置", callback_data="set_strategy_DAY")], [InlineKeyboardButton("🗓 每周重置", callback_data="set_strategy_WEEK")], [InlineKeyboardButton("🌝 每月重置", callback_data="set_strategy_MONTH")], [InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]]
             await update.message.reply_text("🔄 **步骤 5/5：请选择流量重置策略**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return
-    pending_order = get_pending_order_for_user(db_query, user_id)
-    if pending_order and (text or update.message.photo or update.message.document):
-        plan = db_query("SELECT * FROM plans WHERE key = ?", (pending_order['plan_key'],), one=True)
-        if not plan:
-            await update.message.reply_text("❌ 当前订单关联套餐已删除，请重新下单。")
-            update_order_status(db_execute, pending_order['order_id'], [STATUS_PENDING], STATUS_FAILED, error_message='plan_deleted')
-            return
-
-        pay_method = order_payment_method_cache.get(pending_order['order_id'], 'alipay')
-        pay_state = resolve_payment_state(pay_method)
-        if not pay_state['available']:
-            await update.message.reply_text("⚠️ 当前支付方式未配置可用收款，请等待管理员配置后再支付。")
-            return
-
-        proof_payload = {
-            'order_id': pending_order['order_id'],
-            'type': 'text' if text else ('photo' if update.message.photo else 'document'),
-            'text': text or '',
-            'file_id': update.message.photo[-1].file_id if update.message.photo else (update.message.document.file_id if update.message.document else None),
-            'message_id': update.message.message_id,
-            'captured_at': int(time.time()),
-        }
-        context.user_data['pending_payment_proof'] = proof_payload
-        await update.message.reply_text(
-            "✅ 已保存支付凭证，请点击下方按钮提交给管理员审核。",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 完成支付并上传支付凭证", callback_data="client_pay_done_upload")]]),
-        )
-        return
-
+    if user_id in temp_orders and text:
+        order = temp_orders[user_id]
+        plan = db_query("SELECT * FROM plans WHERE key = ?", (order['plan'],), one=True)
+        t_str = "续费" if order['type'] == 'renew' else "新购"
+        admin_msg = f"💰 **审核 {t_str}**\n👤 {update.effective_user.mention_html()} (`{user_id}`)\n📦 {dict(plan)['name']}\n📝 口令：<code>{text}</code>"
+        safe_uuid = order['target_uuid'] if order['target_uuid'] else "0"
+        sid = get_short_id(safe_uuid) if safe_uuid != "0" else "0"
+        kb = [[InlineKeyboardButton("✅ 通过", callback_data=f"ap_{user_id}_{order['plan']}_{order['type']}_{sid}")], [InlineKeyboardButton("❌ 拒绝", callback_data=f"rj_{user_id}_{order['plan']}_{order['type']}_{sid}")]]
+        await context.bot.send_message(ADMIN_ID, admin_msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        msg_obj = await update.message.reply_text("✅ 已提交，等待管理员确认。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]))
+        temp_orders[user_id]['waiting_msg_id'] = msg_obj.message_id
+        if 'menu_msg_id' in temp_orders[user_id]:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=temp_orders[user_id]['menu_msg_id'])
+            except:
+                pass
+            temp_orders[user_id].pop('menu_msg_id', None)
 
 async def add_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2107,39 +2102,43 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     client_return_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]])
     admin_return_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]])
-
-    async def clean_user_waiting_msg(order):
-        waiting_message_id = order.get('waiting_message_id')
-        menu_message_id = order.get('menu_message_id')
-        uid = order.get('tg_id')
-        if waiting_message_id:
-            try:
-                await context.bot.delete_message(chat_id=uid, message_id=waiting_message_id)
-            except Exception as exc:
-                logger.warning("Failed to delete waiting message for %s: %s", uid, exc)
-        if menu_message_id:
-            try:
-                await context.bot.delete_message(chat_id=uid, message_id=menu_message_id)
-            except Exception as exc:
-                logger.warning("Failed to delete menu message for %s: %s", uid, exc)
-
+    async def clean_user_waiting_msg(uid):
+        if uid in temp_orders:
+            if 'waiting_msg_id' in temp_orders[uid]:
+                try: await context.bot.delete_message(chat_id=uid, message_id=temp_orders[uid]['waiting_msg_id'])
+                except: pass
+            if 'menu_msg_id' in temp_orders[uid]:
+                try: await context.bot.delete_message(chat_id=uid, message_id=temp_orders[uid]['menu_msg_id'])
+                except: pass
+            del temp_orders[uid]
+    if data.startswith("review_"):
+        parts = data.split("_")
+        if len(parts) >= 5:
+            uid = parts[1]
+            plan_key = parts[2]
+            order_type = parts[3]
+            sid = parts[4]
+            kb = [
+                [InlineKeyboardButton("✅ 通过", callback_data=f"ap_{uid}_{plan_key}_{order_type}_{sid}")],
+                [InlineKeyboardButton("❌ 拒绝", callback_data=f"rj_{uid}_{plan_key}_{order_type}_{sid}")]
+            ]
+            await query.edit_message_text("🧾 已重新进入审核，请选择操作：", reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await query.edit_message_text("⚠️ 订单数据不完整，无法重新审核。", reply_markup=admin_return_btn)
+        return
     if data.startswith("rj_"):
-        order_id = data.split("_")[1]
-        order = get_order(db_query, order_id)
-        if not order:
-            await query.edit_message_text("⚠️ 订单不存在或已过期", reply_markup=admin_return_btn)
-            return
-        changed = update_order_status(db_execute, order_id, [STATUS_PENDING, STATUS_APPROVED], STATUS_REJECTED, error_message='rejected_by_admin')
-        append_order_audit_log(db_execute, order_id, 'reject', query.from_user.id, 'rejected_by_admin')
-        if not changed and order.get('status') == STATUS_REJECTED:
-            await query.edit_message_text("ℹ️ 该订单已拒绝，无需重复操作", reply_markup=admin_return_btn)
-            return
-        await query.edit_message_text("❌ 已拒绝", reply_markup=admin_return_btn)
-        await clean_user_waiting_msg(order)
-        try:
-            await context.bot.send_message(order['tg_id'], "❌ 您的订单已被管理员拒绝。", reply_markup=client_return_btn)
-        except Exception as exc:
-            logger.warning("Failed to notify rejected order user %s: %s", order['tg_id'], exc)
+        parts = data.split("_")
+        uid = int(parts[1])
+        retry_markup = admin_return_btn
+        if len(parts) >= 5:
+            retry_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧾 再次审核", callback_data=f"review_{parts[1]}_{parts[2]}_{parts[3]}_{parts[4]}")],
+                [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]
+            ])
+        await query.edit_message_text("❌ 已拒绝", reply_markup=retry_markup)
+        await clean_user_waiting_msg(uid)
+        try: await context.bot.send_message(uid, "❌ 您的订单已被管理员拒绝。", reply_markup=client_return_btn)
+        except: pass
         return
 
     if data.startswith("rt_"):
@@ -2552,7 +2551,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^contact_support$"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^client_nodes$"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^view_sub_"))
-    app.add_handler(CallbackQueryHandler(process_order, pattern="^(ap|rj|rt)_"))
+    app.add_handler(CallbackQueryHandler(process_order, pattern="^(ap|rj|review)_"))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
     
     app.job_queue.run_daily(check_expiry_job, time=datetime.time(hour=12, minute=0, second=0))

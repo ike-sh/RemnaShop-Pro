@@ -8,7 +8,8 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 WORK_DIR="/opt/RemnaShop"
 SERVICE_FILE="/etc/systemd/system/remnashop.service"
-WEB_SERVICE_FILE="/etc/systemd/system/remnashop-web.service"
+LEGACY_WEB_SERVICE_FILE="/etc/systemd/system/remnashop-web.service"
+LEGACY_WEB_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/remnashop-web.service"
 
 # 检查是否为 root
 if [ "$EUID" -ne 0 ]; then 
@@ -120,10 +121,10 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-    if [ -f "$WEB_SERVICE_FILE" ]; then
-        systemctl disable --now remnashop-web 2>/dev/null || true
-        rm -f "$WEB_SERVICE_FILE"
-    fi
+    # 兼容历史版本：清理遗留 Web 服务配置，避免出现“enable remnashop-web”相关报错
+    systemctl disable remnashop-web 2>/dev/null || true
+    systemctl stop remnashop-web 2>/dev/null || true
+    rm -f "$LEGACY_WEB_SERVICE_FILE" "$LEGACY_WEB_WANTS_LINK"
 
     systemctl daemon-reload
     systemctl enable remnashop
@@ -151,7 +152,10 @@ uninstall_bot() {
     echo -e "${YELLOW}正在停止服务...${NC}"
     systemctl stop remnashop 2>/dev/null || true
     systemctl disable remnashop 2>/dev/null || true
+    systemctl stop remnashop-web 2>/dev/null || true
+    systemctl disable remnashop-web 2>/dev/null || true
     rm -f "$SERVICE_FILE"
+    rm -f "$LEGACY_WEB_SERVICE_FILE" "$LEGACY_WEB_WANTS_LINK"
     systemctl daemon-reload
     rm -rf "$WORK_DIR"
     echo -e "${GREEN}✅ 卸载完成。所有痕迹已清理。${NC}"
