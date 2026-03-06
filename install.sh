@@ -152,8 +152,6 @@ uninstall_bot() {
     echo -e "${YELLOW}正在停止服务...${NC}"
     systemctl stop remnashop 2>/dev/null || true
     systemctl disable remnashop 2>/dev/null || true
-    systemctl stop remnashop-web 2>/dev/null || true
-    systemctl disable remnashop-web 2>/dev/null || true
     rm -f "$SERVICE_FILE"
     rm -f "$LEGACY_WEB_SERVICE_FILE" "$LEGACY_WEB_WANTS_LINK"
     systemctl daemon-reload
