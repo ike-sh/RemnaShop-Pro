@@ -91,12 +91,14 @@ def _get_support_session_store(application):
 def set_support_reply_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, source: str, admin_id: int | None = None):
     store = _get_support_session_store(context.application)
     now_ts = int(time.time())
+    current = store.get(int(user_id)) if isinstance(store.get(int(user_id)), dict) else {}
     store[int(user_id)] = {
         'active': True,
         'source': source,
         'admin_id': int(admin_id) if admin_id else None,
         'updated_at': now_ts,
         'expire_at': now_ts + SUPPORT_REPLY_TTL_SECONDS,
+        'control_message_id': current.get('control_message_id'),
     }
 
 
@@ -119,6 +121,42 @@ def clear_support_reply_session(context: ContextTypes.DEFAULT_TYPE, user_id: int
     existed = store.pop(int(user_id), None)
     if existed:
         logger.info("support reply context cleared: user=%s reason=%s", user_id, reason)
+
+
+async def delete_message_if_possible(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id):
+    if not message_id:
+        return False
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+        return True
+    except Exception as exc:
+        logger.debug("delete message skipped: chat=%s msg=%s err=%s", chat_id, message_id, exc)
+        return False
+
+
+async def upsert_support_control_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, reply_markup):
+    store = _get_support_session_store(context.application)
+    sess = store.get(int(user_id)) if isinstance(store.get(int(user_id)), dict) else {}
+    msg_id = sess.get('control_message_id')
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=user_id, message_id=int(msg_id), text=text, parse_mode='Markdown', reply_markup=reply_markup)
+            return int(msg_id)
+        except Exception as exc:
+            logger.debug("edit support control message failed, fallback send new: user=%s msg=%s err=%s", user_id, msg_id, exc)
+    sent = await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown', reply_markup=reply_markup)
+    sess = sess if isinstance(sess, dict) else {}
+    sess['control_message_id'] = sent.message_id
+    sess['updated_at'] = int(time.time())
+    store[int(user_id)] = sess
+    return sent.message_id
+
+
+async def cleanup_admin_reply_prompt(context: ContextTypes.DEFAULT_TYPE, admin_id: int, admin_state: dict, reason: str):
+    prompt_id = admin_state.pop('reply_prompt_message_id', None)
+    if prompt_id:
+        ok = await delete_message_if_possible(context, admin_id, prompt_id)
+        logger.info("cleanup admin reply prompt: admin=%s prompt=%s reason=%s deleted=%s", admin_id, prompt_id, reason, ok)
 
 def get_short_id(real_uuid):
     for sid, uid in uuid_map.items():
@@ -728,6 +766,18 @@ async def send_or_edit_menu(update, context, text, reply_markup, parse_mode='Mar
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user_id = update.effective_user.id
+    support_ctx = get_support_reply_session(context, user_id)
+    if support_ctx and support_ctx.get('control_message_id'):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=int(support_ctx.get('control_message_id')),
+                text="✅ 客服会话已结束。若需继续，请点击“联系客服”。",
+                parse_mode='Markdown',
+                reply_markup=None,
+            )
+        except Exception as exc:
+            logger.debug("close support control prompt failed: user=%s err=%s", user_id, exc)
     clear_support_reply_session(context, user_id, reason='enter_start_menu')
     args = getattr(context, 'args', None) or []
     if args:
@@ -822,6 +872,12 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         support_ctx = {'source': 'user_initiated', 'updated_at': int(time.time())}
         context.user_data['support_reply_context'] = support_ctx
         set_support_reply_session(context, user_id, source='user_initiated')
+        if query.message:
+            store = _get_support_session_store(context.application)
+            sess = store.get(int(user_id), {})
+            if isinstance(sess, dict):
+                sess['control_message_id'] = query.message.message_id
+                store[int(user_id)] = sess
         logger.info("user entered support mode: user=%s source=user_initiated", user_id)
         msg = dynamic_snippets_cache.get("support_contact_tip") or "📞 **客服模式已开启**\n请直接发送文字、图片或文件。\n🚪 结束咨询请点击下方按钮。"
         keyboard = [[InlineKeyboardButton("🚪 结束咨询", callback_data="back_home")]]
@@ -1319,6 +1375,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not data.startswith("reply_user_"):
         if 'reply_to_uid' in context.user_data:
             logger.info("admin reply mode cleared by callback: admin=%s callback=%s", query.from_user.id, data)
+        await cleanup_admin_reply_prompt(context, query.from_user.id, context.user_data, reason=f'callback:{data}')
         context.user_data.pop('reply_to_uid', None)
         context.user_data.pop('reply_back_cb', None)
     
@@ -1333,11 +1390,13 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             uid_part, back_cb = raw, "back_home"
         target_uid = int(uid_part)
+        await cleanup_admin_reply_prompt(context, query.from_user.id, context.user_data, reason='enter_new_reply_mode')
         context.user_data['reply_to_uid'] = target_uid
         context.user_data['reply_back_cb'] = back_cb
         logger.info("admin enter send-to-user mode: admin=%s target_user=%s back_cb=%s", query.from_user.id, target_uid, back_cb)
         cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回上一页", callback_data=back_cb)]])
-        await query.message.reply_text(f"✍️ 请输入回复给用户 `{target_uid}` 的内容 (文字/图片)：", parse_mode='Markdown', reply_markup=cancel_kb)
+        prompt_msg = await query.message.reply_text(f"✍️ 请输入回复给用户 `{target_uid}` 的内容 (文字/图片)：", parse_mode='Markdown', reply_markup=cancel_kb)
+        context.user_data['reply_prompt_message_id'] = prompt_msg.message_id
         return
     if data == "cancel_op":
         context.user_data.clear()
@@ -2384,19 +2443,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.copy_message(chat_id=target_uid, from_chat_id=user_id, message_id=update.message.message_id)
             set_support_reply_session(context, target_uid, source='admin_direct_reply', admin_id=user_id)
             logger.info("admin message delivered and support context activated: admin=%s target_user=%s", user_id, target_uid)
-            await context.bot.send_message(
+            await upsert_support_control_message(
+                context,
                 target_uid,
                 "👆 **来自客服/管理员的回复**\n你现在处于客服会话模式，下一条消息将直接发送给客服。",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([
+                InlineKeyboardMarkup([
                     [InlineKeyboardButton("✉️ 继续回复客服", callback_data="contact_support")],
                     [InlineKeyboardButton("🚪 结束会话", callback_data="back_home")],
                 ]),
             )
-            admin_done_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回上一页", callback_data=back_cb)]])
-            await update.message.reply_text("✅ 回复已送达！", reply_markup=admin_done_kb)
+            await cleanup_admin_reply_prompt(context, user_id, context.user_data, reason='send_success')
+            await update.message.reply_text("✅ 回复已送达，已进入会话状态。")
         except Exception as e:
             await update.message.reply_text(f"❌ 发送失败：{e}")
+            admin_done_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回上一页", callback_data=back_cb)]])
+            await update.message.reply_text("你可以重试，或返回上一页。", reply_markup=admin_done_kb)
         del context.user_data['reply_to_uid']
         context.user_data.pop('reply_back_cb', None)
         return
@@ -2417,7 +2478,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ 回复此用户", callback_data=f"reply_user_{user_id}_back_home")]])
         await context.bot.send_message(ADMIN_ID, admin_header, reply_markup=reply_kb, parse_mode='HTML')
         await context.bot.copy_message(chat_id=ADMIN_ID, from_chat_id=user_id, message_id=update.message.message_id)
-        await update.message.reply_text("✅ 已转发给客服。你可继续发送消息，或点击下方结束会话。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚪 结束会话", callback_data="back_home")]]))
+        await upsert_support_control_message(
+            context,
+            user_id,
+            "✅ 已转发给客服。你可继续发送消息，或点击下方结束会话。",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🚪 结束会话", callback_data="back_home")]]),
+        )
         return
     if user_id == ADMIN_ID and context.user_data.get('setting_notify') and text:
         if text.isdigit():
