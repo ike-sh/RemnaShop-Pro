@@ -97,7 +97,7 @@ def check_cooldown(user_id):
     return True
 
 def get_strategy_label(strategy):
-    mapping = {'NO_RESET': '总流量', 'DAY': '每日重置', 'WEEK': '每周重置', 'MONTH': '每月重置'}
+    mapping = {'NO_RESET': '总流量', 'DAY': '每日重置', 'WEEK': '每周重置', 'MONTH': '每月重置', 'MONTH_ROLLING': '按开通日每月重置'}
     return mapping.get(strategy, '总流量')
 
 def draw_progress_bar(used, total, length=10):
@@ -958,7 +958,16 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_order_confirmation(update, context, plan_key, order_type, short_id, payment_method='manual_review')
 
     elif data.startswith("paymethod_"):
-        await query.answer("当前仅支持人工审核流程，请返回重试。", show_alert=True)
+        parts = data.split("_", 4)
+        if len(parts) < 5:
+            logger.warning("Invalid paymethod callback payload: %s", data)
+            await query.answer("参数错误", show_alert=True)
+            return
+        _, pay_method, plan_key, order_type, short_id = parts
+        if pay_method != "usdt":
+            await query.answer("当前客户端仅支持 人工审核 / USDT。", show_alert=True)
+            return
+        await handle_order_confirmation(update, context, plan_key, order_type, short_id, payment_method='usdt')
 
     elif data == "cancel_order":
         pending = get_pending_order_for_user(db_query, user_id)
@@ -984,6 +993,8 @@ async def show_payment_method_menu(update, context, plan_key, order_type, short_
         "请选择下一步："
     )
     kb = [[InlineKeyboardButton("🧾 人工审核", callback_data=f"manualreview_{plan_key}_{order_type}_{short_id}")]]
+    if resolve_payment_state('usdt')['available'] and str(plan_dict.get('usdt_price') or '').strip():
+        kb.append([InlineKeyboardButton("🟨 USDT", callback_data=f"paymethod_usdt_{plan_key}_{order_type}_{short_id}")])
     kb.append([InlineKeyboardButton("🔙 返回", callback_data="back_home")])
     await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
 
@@ -1012,6 +1023,8 @@ async def submit_manual_review_proof(update: Update, context: ContextTypes.DEFAU
     plan_dict = dict(plan)
     strategy_label = get_strategy_label(plan_dict.get('reset_strategy', 'NO_RESET'))
     type_str = "续费" if pending_order['order_type'] == 'renew' else "新购"
+    selected_path = order_payment_method_cache.get(order_id, 'manual_review')
+    selected_path_label = "USDT" if selected_path == "usdt" else "人工审核"
     target_uuid = pending_order['target_uuid'] if pending_order['target_uuid'] else "0"
     sid = get_short_id(target_uuid) if target_uuid != "0" else "0"
     username = update.effective_user.username or "-"
@@ -1033,6 +1046,7 @@ async def submit_manual_review_proof(update: Update, context: ContextTypes.DEFAU
         f"💰 金额: {plan_dict.get('price')}\n"
         f"📡 流量: {plan_dict.get('gb')} GB ({strategy_label})\n"
         f"🧩 类型: {type_str}\n"
+        f"🛣 路径: {selected_path_label}\n"
         f"🏷 渠道码: {pending_order.get('channel_code') or '-'}\n"
         f"📝 用户凭证: {proof_text}"
     )
@@ -1050,7 +1064,7 @@ async def submit_manual_review_proof(update: Update, context: ContextTypes.DEFAU
 
     append_order_audit_log(db_execute, order_id, 'submit_manual_review', user_id, f"proof_type={proof_type}")
     attach_admin_message(db_execute, order_id, admin_message.message_id)
-    attach_payment_text(db_execute, order_id, f"方式:人工审核|{proof_text}")
+    attach_payment_text(db_execute, order_id, f"方式:{selected_path_label}|{proof_text}")
     context.user_data.pop('pending_payment_proof', None)
     context.user_data.pop('awaiting_manual_review_proof_order_id', None)
     await update.message.reply_text(
@@ -1058,18 +1072,15 @@ async def submit_manual_review_proof(update: Update, context: ContextTypes.DEFAU
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]),
     )
 
-async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-    if isinstance(update, Update) and update.callback_query:
-        callback_data = update.callback_query.data
-        user_id = update.callback_query.from_user.id
-        logger.exception("Unhandled callback exception: user_id=%s callback_data=%s error=%s", user_id, callback_data, err)
-        try:
-            await update.callback_query.answer("⚠️ 系统异常，请稍后重试。", show_alert=True)
-        except Exception:
-            pass
+
+async def cleanup_panelcfg_prompt_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    msg_id = context.user_data.pop('panelcfg_prompt_message_id', None)
+    if not msg_id:
         return
-    logger.exception("Unhandled telegram update exception: %s", err)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception as exc:
+        logger.debug("failed to cleanup panelcfg prompt message %s: %s", msg_id, exc)
 
 
 async def handle_order_confirmation(update, context, plan_key, order_type, short_id, payment_method='alipay'):
@@ -1092,21 +1103,33 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
     order, created = create_order(db_query, db_execute, user_id, plan_key, order_type, target_uuid, menu_message_id=msg_id, channel_code=context.user_data.get('channel_code'))
     if created:
         append_order_audit_log(db_execute, order['order_id'], 'create', user_id, f"type={order_type};plan={plan_key};channel={context.user_data.get('channel_code') or '-'}")
-        order_payment_method_cache[order["order_id"]] = "manual_review"
+        selected_path = "usdt" if payment_method == "usdt" else "manual_review"
+        order_payment_method_cache[order["order_id"]] = selected_path
         context.user_data['awaiting_manual_review_proof_order_id'] = order['order_id']
         context.user_data.pop('pending_payment_proof', None)
     else:
         msg = "⚠️ 你已有一个待审核订单，请先等待管理员处理，或取消后重新下单。"
         await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
         return
+    path_label = "USDT" if payment_method == "usdt" else "人工审核"
+    extra_tip = "👇 请直接在聊天中发送支付凭证（文字说明、截图、图片或文件），发送后会自动提交人工审核。"
+    if payment_method == "usdt":
+        usdt_info = resolve_payment_state('usdt')
+        usdt_price = str(plan_dict.get('usdt_price') or '').strip()
+        if not usdt_info['available'] or not usdt_price:
+            await send_or_edit_menu(update, context, "⚠️ 当前 USDT 未配置完整，请选择人工审核。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+            return
+        extra_tip = f"💰 USDT 金额：**{usdt_price} USDT**\n{usdt_info['pay_tip']}\n\n👇 完成后请发送 TXID/截图/说明，发送后会自动提交人工审核。"
     msg = (
-        f"📝 **订单已创建（人工审核）**\n"
+        f"📝 **订单已创建**\n"
         f"🆔 订单号：`{order['order_id']}`\n"
         f"📦 套餐：{plan_dict['name']}\n"
         f"💰 金额：**{plan_dict.get('price')}**\n"
         f"📡 流量：**{plan_dict['gb']} GB ({strategy_label})**\n"
-        f"🧩 类型：**{type_str}**\n\n"
-        "👇 请直接在聊天中发送支付凭证（文字说明、截图、图片或文件），发送后会自动提交人工审核。"
+        f"🧩 类型：**{type_str}**\n"
+        f"🧾 路径：**{path_label}**\n\n"
+        f"🆔 系统将自动使用当前 Telegram ID：`{user_id}`\n"
+        f"{extra_tip}"
     )
     kb = [[InlineKeyboardButton("❌ 取消订单", callback_data="cancel_order")], [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]
     await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
@@ -1230,6 +1253,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await start(update, context)
         return
     if data == "admin_panel_config":
+        context.user_data.pop('panelcfg_prompt_message_id', None)
         masked = PANEL_TOKEN[:6] + "***" if PANEL_TOKEN else "未配置"
         msg = (
             "🔌 **面板对接配置**\n"
@@ -1260,6 +1284,8 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         }
         key, tip = mode_map[data]
         context.user_data[key] = True
+        if query.message:
+            context.user_data['panelcfg_prompt_message_id'] = query.message.message_id
         await send_or_edit_menu(update, context, f"✍️ {tip}", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_panel_config")]]))
         return
     if data == "panelcfg_toggle_tls":
@@ -2080,21 +2106,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_url') and text:
         save_runtime_config(panel_url=text.strip())
         context.user_data.pop('panelcfg_input_url', None)
+        await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 面板地址已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_token') and text:
         save_runtime_config(panel_token=text.strip())
         context.user_data.pop('panelcfg_input_token', None)
+        await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 面板 Token 已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_subdomain') and text:
         save_runtime_config(sub_domain=text.strip())
         context.user_data.pop('panelcfg_input_subdomain', None)
+        await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 订阅域名已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_group') and text:
         save_runtime_config(group_uuid=text.strip())
         context.user_data.pop('panelcfg_input_group', None)
+        await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 默认组 UUID 已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('edit_subscription_settings') and text:
@@ -2299,7 +2329,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == 'gb':
             if not text.isdigit(): return await update.message.reply_text("❌ 请输入数字", reply_markup=cancel_kb)
             context.user_data['new_plan']['gb'] = int(text)
-            keyboard = [[InlineKeyboardButton("🚫 永不重置", callback_data="set_strategy_NO_RESET")], [InlineKeyboardButton("📅 每日重置", callback_data="set_strategy_DAY")], [InlineKeyboardButton("🗓 每周重置", callback_data="set_strategy_WEEK")], [InlineKeyboardButton("🌝 每月重置", callback_data="set_strategy_MONTH")], [InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]]
+            keyboard = [[InlineKeyboardButton("🚫 永不重置", callback_data="set_strategy_NO_RESET")], [InlineKeyboardButton("📅 每日重置", callback_data="set_strategy_DAY")], [InlineKeyboardButton("🗓 每周重置", callback_data="set_strategy_WEEK")], [InlineKeyboardButton("🌝 每月重置", callback_data="set_strategy_MONTH")], [InlineKeyboardButton("🌙 按开通日每月重置", callback_data="set_strategy_MONTH_ROLLING")], [InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]]
             await update.message.reply_text("🔄 **步骤 6/6：请选择流量重置策略**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return
     pending_order = get_pending_order_for_user(db_query, user_id)
@@ -2482,6 +2512,7 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "trafficLimitBytes": new_limit,
                 "expireAt": expire_iso,
                 "status": USER_STATUS_ACTIVE,
+                "telegramId": int(uid),
                 "activeInternalSquads": [TARGET_GROUP_UUID],
                 "trafficLimitStrategy": reset_strategy,
             }
@@ -2516,6 +2547,7 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payload = {
                 "username": f"tg_{uid}_{int(time.time())}",
                 "status": USER_STATUS_ACTIVE,
+                "telegramId": int(uid),
                 "trafficLimitBytes": add_traffic,
                 "trafficLimitStrategy": reset_strategy,
                 "expireAt": expire_iso,
