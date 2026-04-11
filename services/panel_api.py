@@ -237,7 +237,6 @@ async def probe_api_capabilities(panel_url, headers, verify_tls=True):
         "users_bulk_delete": ('POST', '/users/bulk/delete', {"uuids": []}),
         "subscription_history": ('GET', '/subscription-request-history', None),
         "ip_control": ('GET', '/ip-control', None),
-        "metadata": ('GET', '/metadata', None),
         "system_health": ('GET', '/system/health', None),
         "snippets": ('GET', '/snippets', None),
         "subscription_page_configs": ('GET', '/subscription-page-configs', None),
