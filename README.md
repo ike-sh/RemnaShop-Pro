@@ -68,20 +68,20 @@ cp .env.example .env
 ### 2) 启动
 
 ```bash
-docker compose up -d --build
+./docker-manage.sh up
 ```
 
 ### 3) 运行检查
 
 ```bash
-docker compose ps
-docker compose logs -f remnashop
+./docker-manage.sh ps
+./docker-manage.sh logs
 ```
 
 ### 4) 停止
 
 ```bash
-docker compose down
+./docker-manage.sh down
 ```
 
 ### 5) 配置策略（推荐）
@@ -112,25 +112,38 @@ docker compose down
 备份示例（导出命名卷到当前目录）：
 
 ```bash
-mkdir -p backup
-docker run --rm -v remnashop-pro_remnashop-data:/from -v "$PWD/backup:/to" alpine sh -c "cp -a /from/. /to/"
+./docker-manage.sh backup
 ```
 
 恢复示例：
 
 ```bash
-docker run --rm -v remnashop-pro_remnashop-data:/to -v "$PWD/backup:/from" alpine sh -c "cp -a /from/. /to/"
+./docker-manage.sh restore
 ```
 
 ### 7) 升级流程（生产建议）
 
 ```bash
 git pull
-docker compose up -d --build
-docker compose ps
+./docker-manage.sh up
+./docker-manage.sh ps
 ```
 
 本 Compose 已内置生产向配置：`healthcheck`、日志轮转、`init: true`、`no-new-privileges`、`tmpfs /tmp`、`unless-stopped` 重启策略。
+
+### 8) 一键运维命令总览
+
+```bash
+./docker-manage.sh init-env   # 初始化 .env
+./docker-manage.sh up         # 构建并启动
+./docker-manage.sh update     # git pull + 重建启动
+./docker-manage.sh restart    # 重启服务
+./docker-manage.sh logs       # 实时日志
+./docker-manage.sh ps         # 运行状态
+./docker-manage.sh down       # 停止容器
+./docker-manage.sh backup     # 备份卷数据
+./docker-manage.sh restore    # 恢复卷数据
+```
 
 ---
 
