@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 
 ```text
 [remnashop-bootstrap] 正在配置必填环境变量（仅 ADMIN_ID 与 BOT_TOKEN）。
-检测到现有 ADMIN_ID='123456789'，是否保留？[Y/n]:
+请输入 ADMIN_ID:
 请输入 BOT_TOKEN:
 ```
 
@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 不会触碰其他 Compose 项目或无关 Docker 资源。
 
 > 卸载安全行为：
-> - 检测到交互终端时，必须手动输入 `YES` 才会执行删除；
+> - 检测到交互终端时，必须手动确认才会执行删除（支持 `YES` / `yes` / `Y` / `y`）；
 > - 非交互场景（如远程 `curl | bash -s -- uninstall`）会跳过确认，但仍只针对 `remnashop` 项目资源操作；
 > - 卸载为幂等操作：资源已不存在时只给出提示，不会报错中断。
 
@@ -149,7 +149,10 @@ cd /opt/remnashop-pro
 - `ADMIN_ID`
 - `BOT_TOKEN`
 
+`.env.example` 中这两个字段默认是空值（`ADMIN_ID=`、`BOT_TOKEN=`），用于确保首次安装必须由管理员输入真实值。
+
 若 `.env` 已存在，脚本会展示当前值，并询问你“保留还是替换”。
+若 `.env` 来自模板且 `ADMIN_ID` / `BOT_TOKEN` 为空，脚本会直接要求输入新值，不会询问“是否保留空值”。
 脚本会校验 `ADMIN_ID` 与 `BOT_TOKEN` 不可为空，否则不会继续部署。
 脚本通过 `/dev/tty` 进行交互输入；若当前执行环境无可用 TTY，则会明确报错并提示先在 `.env` 预置必填值后再执行安装。
 

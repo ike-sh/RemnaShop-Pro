@@ -146,7 +146,7 @@ install_base_dependencies() {
   ensure_cmd_with_package git git
 
   if ! require_cmd update-ca-certificates; then
-    warn "Dependency missing: ca-certificates. Attempting automatic install."
+    warn "缺少依赖：ca-certificates。正在尝试自动安装。"
     install_packages ca-certificates
     if ! require_cmd update-ca-certificates; then
       err "ca-certificates 自动安装失败。"
@@ -499,13 +499,13 @@ install_flow() {
 
 ✅ RemnaShop-Pro 安装完成。
 
-Install directory: ${INSTALL_DIR}
+安装目录: ${INSTALL_DIR}
 成功判定条件已满足：
-  - docker compose up completed
-  - remnashop container reached health=healthy
+  - docker compose up 已完成
+  - remnashop 容器已达到 health=healthy
 后续可执行：
-  1) Check status: cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} ps
-  2) Check logs:   cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} logs -f remnashop
+  1) 查看状态: cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} ps
+  2) 查看日志: cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} logs -f remnashop
 
 MSG
 }
