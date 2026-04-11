@@ -50,6 +50,103 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main
 
 ---
 
+## Docker Compose 部署
+
+### 1) 初始化环境变量（生产推荐）
+
+```bash
+cp .env.example .env
+```
+
+按需编辑 `.env`，至少填写：
+
+- `ADMIN_ID`
+- `BOT_TOKEN`
+
+其余面板参数建议一并填写，便于首次启动自动生成 `config.json`。
+
+### 2) 启动
+
+```bash
+./docker-manage.sh up
+```
+
+### 3) 运行检查
+
+```bash
+./docker-manage.sh ps
+./docker-manage.sh logs
+```
+
+### 4) 停止
+
+```bash
+./docker-manage.sh down
+```
+
+### 5) 配置策略（推荐）
+
+可选两种方式：
+
+- **方式 A（推荐）**：首次由容器根据 `.env` 自动生成 `/data/config.json`，后续固定使用该配置。
+- **方式 B**：自行维护 `config.json` 后挂载到 `/data/config.json`。
+
+示例 `config.json`：
+
+```json
+{
+  "admin_id": "123456789",
+  "bot_token": "123456:ABCDEF",
+  "panel_url": "https://panel.example.com",
+  "panel_token": "your_panel_api_token",
+  "sub_domain": "https://sub.example.com",
+  "group_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "panel_verify_tls": true
+}
+```
+
+### 6) 数据持久化与备份
+
+当前 Compose 使用命名卷 `remnashop-data` 保存 `/data/config.json` 与 `/data/starlight.db`。
+
+备份示例（导出命名卷到当前目录）：
+
+```bash
+./docker-manage.sh backup
+```
+
+恢复示例：
+
+```bash
+./docker-manage.sh restore
+```
+
+### 7) 升级流程（生产建议）
+
+```bash
+git pull
+./docker-manage.sh up
+./docker-manage.sh ps
+```
+
+本 Compose 已内置生产向配置：`healthcheck`、日志轮转、`init: true`、`no-new-privileges`、`tmpfs /tmp`、`unless-stopped` 重启策略。
+
+### 8) 一键运维命令总览
+
+```bash
+./docker-manage.sh init-env   # 初始化 .env
+./docker-manage.sh up         # 构建并启动
+./docker-manage.sh update     # git pull + 重建启动
+./docker-manage.sh restart    # 重启服务
+./docker-manage.sh logs       # 实时日志
+./docker-manage.sh ps         # 运行状态
+./docker-manage.sh down       # 停止容器
+./docker-manage.sh backup     # 备份卷数据
+./docker-manage.sh restore    # 恢复卷数据
+```
+
+---
+
 ## 配置文件
 
 配置文件路径：`/opt/RemnaShop/config.json`
