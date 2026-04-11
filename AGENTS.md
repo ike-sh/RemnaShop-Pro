@@ -1,35 +1,20 @@
-## Required bootstrap behavior
-The repository must keep a single bootstrap entrypoint.
+## Required bootstrap UX
+The bootstrap install experience should be Chinese for end users.
 
-The bootstrap implementation must support:
-- install
-- uninstall
-
-A fresh Debian or Ubuntu server must be able to start installation successfully with minimal manual prerequisites.
-The bootstrap script must automatically install missing common base dependencies when possible, including:
-- curl
-- ca-certificates
-- git
-- bash
-- tar
-- gzip
-- unzip
-- jq
-
-Do not leave common prerequisites as manual README steps.
-
-During install, the bootstrap script must collect required environment values interactively, especially:
+During install, only these values are required interactively:
 - ADMIN_ID
 - BOT_TOKEN
 
-The script must write these values into .env automatically.
-Do not leave ADMIN_ID and BOT_TOKEN as a normal manual post-install requirement.
+Other .env values must remain optional during bootstrap install and must not block deployment.
 
-Install must only report success after the remnashop container becomes healthy.
-It must not report success merely because docker compose up -d returned successfully.
+## Production image contents
+The production image must exclude non-runtime repository files, including:
+- tests/
+- docs/
+- README.md
+- AGENTS.md
+- LICENSE
+- .gitignore
+- .env.example
 
-Uninstall must only remove RemnaShop-Pro resources and must never affect unrelated Docker Compose projects on the host.
-Do not use broad Docker cleanup commands.
-
-If documentation changes, the actual script behavior must be updated to match.
-Do not solve bootstrap tasks with documentation-only changes.
+Keep these files in the repository, but do not include them in the production image.
