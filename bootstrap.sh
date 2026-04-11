@@ -258,22 +258,10 @@ upsert_env_value() {
   fi
 }
 
-input_fd() {
-  if [ -t 0 ]; then
-    echo "/dev/stdin"
-  elif { exec 3</dev/tty; } 2>/dev/null; then
-    echo "/dev/fd/3"
-  else
-    echo ""
-  fi
-}
-
 prompt_required_env() {
-  local fd
-  fd="$(input_fd)"
-  if [ -z "${fd}" ]; then
+  if [ ! -r /dev/tty ]; then
     err "Interactive input is required to set ADMIN_ID and BOT_TOKEN, but no TTY is available."
-    err "Run on a terminal or preconfigure ${INSTALL_DIR}/.env before install."
+    err "Run with a terminal (for example: curl -fsSL <raw-script-url> | bash), or preconfigure ${INSTALL_DIR}/.env before install."
     exit 1
   fi
 
@@ -285,10 +273,12 @@ prompt_required_env() {
   log "Configure required environment values."
 
   if [ -n "${admin_current}" ]; then
-    read -r -p "Existing ADMIN_ID='${admin_current}'. Keep it? [Y/n]: " keep <"${fd}"
+    printf "Existing ADMIN_ID='%s'. Keep it? [Y/n]: " "${admin_current}" >/dev/tty
+    read -r keep </dev/tty
     if [[ ! "${keep:-Y}" =~ ^[Yy]$ ]]; then
       while true; do
-        read -r -p "Enter ADMIN_ID: " admin_new <"${fd}"
+        printf "Enter ADMIN_ID: " >/dev/tty
+        read -r admin_new </dev/tty
         if [ -n "${admin_new}" ]; then
           upsert_env_value "ADMIN_ID" "${admin_new}"
           break
@@ -298,7 +288,8 @@ prompt_required_env() {
     fi
   else
     while true; do
-      read -r -p "Enter ADMIN_ID: " admin_new <"${fd}"
+      printf "Enter ADMIN_ID: " >/dev/tty
+      read -r admin_new </dev/tty
       if [ -n "${admin_new}" ]; then
         upsert_env_value "ADMIN_ID" "${admin_new}"
         break
@@ -308,10 +299,12 @@ prompt_required_env() {
   fi
 
   if [ -n "${bot_current}" ]; then
-    read -r -p "Existing BOT_TOKEN='${bot_current}'. Keep it? [Y/n]: " keep <"${fd}"
+    printf "Existing BOT_TOKEN='%s'. Keep it? [Y/n]: " "${bot_current}" >/dev/tty
+    read -r keep </dev/tty
     if [[ ! "${keep:-Y}" =~ ^[Yy]$ ]]; then
       while true; do
-        read -r -p "Enter BOT_TOKEN: " bot_new <"${fd}"
+        printf "Enter BOT_TOKEN: " >/dev/tty
+        read -r bot_new </dev/tty
         if [ -n "${bot_new}" ]; then
           upsert_env_value "BOT_TOKEN" "${bot_new}"
           break
@@ -321,7 +314,8 @@ prompt_required_env() {
     fi
   else
     while true; do
-      read -r -p "Enter BOT_TOKEN: " bot_new <"${fd}"
+      printf "Enter BOT_TOKEN: " >/dev/tty
+      read -r bot_new </dev/tty
       if [ -n "${bot_new}" ]; then
         upsert_env_value "BOT_TOKEN" "${bot_new}"
         break
@@ -332,11 +326,8 @@ prompt_required_env() {
 
   if [ -z "$(get_env_value "ADMIN_ID")" ] || [ -z "$(get_env_value "BOT_TOKEN")" ]; then
     err "ADMIN_ID and BOT_TOKEN must both be set in ${INSTALL_DIR}/.env."
-    [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
     exit 1
   fi
-
-  [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
 }
 
 start_stack() {
@@ -474,9 +465,7 @@ remove_project_directory() {
 }
 
 confirm_uninstall_if_needed() {
-  local fd
-  fd="$(input_fd)"
-  if [ -z "${fd}" ]; then
+  if [ ! -r /dev/tty ]; then
     warn "No interactive TTY detected; proceeding without confirmation prompt."
     return
   fi
@@ -486,13 +475,12 @@ confirm_uninstall_if_needed() {
   warn "- compose project: ${PROJECT_NAME}"
   warn "- containers/images/volumes created by this project"
   warn "- directory: ${INSTALL_DIR}"
-  read -r -p "Type 'YES' to confirm uninstall: " confirm <"${fd}"
+  printf "Type 'YES' to confirm uninstall: " >/dev/tty
+  read -r confirm </dev/tty
   if [ "${confirm}" != "YES" ]; then
     log "Uninstall canceled."
-    [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
     exit 0
   fi
-  [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
 }
 
 install_flow() {
