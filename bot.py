@@ -30,7 +30,7 @@ from handlers.admin import format_order_detail, format_order_row, order_status_l
 from handlers.client import build_nodes_status_message
 from jobs.anomaly import build_anomaly_incidents
 from jobs.expiry import should_send_expire_notice
-from utils.constants import APP_VERSION, USER_STATUS_ACTIVE, USER_STATUS_LIMITED
+from utils.constants import APP_VERSION, USER_STATUS_ACTIVE, USER_STATUS_LIMITED, USER_STATUS_DISABLED
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
@@ -510,11 +510,32 @@ async def warmup_panel_runtime_data():
         logger.info("Panel health/info loaded: keys=%s", ",".join(sorted(list(health.keys()))[:12]))
     await refresh_dynamic_snippets()
     try:
+        page_cfg = await get_panel_subscription_page_configs()
+        if isinstance(page_cfg, dict):
+            ui_hints = page_cfg.get('uiHints') if isinstance(page_cfg.get('uiHints'), dict) else {}
+            for key, value in ui_hints.items():
+                if isinstance(key, str) and isinstance(value, str) and value.strip():
+                    dynamic_snippets_cache.setdefault(key, value.strip())
         squads = await get_panel_external_squads()
         profiles = await get_panel_config_profiles()
         logger.info("Panel inventory external_squads=%s config_profiles=%s", len(squads), len(profiles))
     except Exception as exc:
         logger.warning("Panel inventory warmup failed: %s", exc)
+
+
+async def apply_user_status_bulk_with_fallback(uuids, status):
+    if not uuids:
+        return
+    target = sorted(set(str(u) for u in uuids if u))
+    resp = await bulk_update_panel_users(target, {"status": status})
+    if resp and resp.status_code in (200, 201, 204):
+        return
+    logger.warning("bulk status update failed, fallback to single requests status=%s count=%s", status, len(target))
+    for uid in target:
+        if status == USER_STATUS_DISABLED:
+            await disable_panel_user(uid)
+        else:
+            await patch_panel_user({"uuid": uid, "status": status})
 
 
 async def build_squad_capacity_summary(max_users=60):
@@ -2612,7 +2633,7 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
     tasks = [check_single_sub(sub) for sub in subs]
     await asyncio.gather(*tasks)
     if to_disable_uuids:
-        await bulk_update_panel_users(to_disable_uuids, {"status": "DISABLED"})
+        await apply_user_status_bulk_with_fallback(to_disable_uuids, USER_STATUS_DISABLED)
     if to_delete_uuids:
         await bulk_delete_panel_users(to_delete_uuids)
 
@@ -2753,9 +2774,9 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Failed to notify anomaly admin: %s", exc)
 
         if high_risk_disable_uuids:
-            await bulk_update_panel_users(high_risk_disable_uuids, {"status": "DISABLED"})
+            await apply_user_status_bulk_with_fallback(high_risk_disable_uuids, USER_STATUS_DISABLED)
         if mid_risk_limited_uuids:
-            await bulk_update_panel_users(mid_risk_limited_uuids, {"status": USER_STATUS_LIMITED})
+            await apply_user_status_bulk_with_fallback(mid_risk_limited_uuids, USER_STATUS_LIMITED)
 
         set_risk_watchlist(watchlist)
         set_json_setting('risk_unfreeze_candidates', unfreeze_candidates)
