@@ -1,12 +1,22 @@
 # Project instructions
 
-## API contract
-Use `docs/remnawave-openapi.json` as the source of truth for all Remnawave API integration work.
+## Goal
+This repository must support only Docker Compose deployment.
+Remove or replace any standalone server-install deployment flow, scripts, docs, and references.
 
-## Requirements
-- Do not invent endpoints, request fields, or response fields.
-- Read the existing codebase first and modify current code instead of rewriting unrelated modules.
-- Preserve current project structure and coding style.
-- For endpoints that require Authorization, implement bearer token support.
-- Prefer small, reviewable changes.
-- Run relevant tests or checks after making changes.
+## Source of truth
+Use `docs/remnawave-openapi.json` as the source of truth for Remnawave API integration work.
+
+## Constraints
+- Preserve existing app behavior unless a change is required for Docker Compose-only deployment.
+- Do not keep two parallel installation methods.
+- Prefer small, reviewable changes over broad rewrites.
+- Update docs, scripts, and environment examples to match the new Docker Compose-only setup.
+- If legacy install scripts are no longer needed, remove them cleanly.
+- Keep secrets out of the repository.
+
+## Deliverables
+- A single supported Docker Compose deployment path
+- Updated README and installation docs
+- One-command install or bootstrap flow for a fresh Linux server
+- Validation steps showing how to start and verify the stack
