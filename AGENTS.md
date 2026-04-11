@@ -5,9 +5,18 @@ The bootstrap implementation must support:
 - install
 - uninstall
 
-A fresh Debian or Ubuntu server with only curl available must be able to start installation successfully.
-The bootstrap script must automatically install git if it is missing.
-Do not leave git as a manual prerequisite.
+A fresh Debian or Ubuntu server must be able to start installation successfully with minimal manual prerequisites.
+The bootstrap script must automatically install missing common base dependencies when possible, including:
+- curl
+- ca-certificates
+- git
+- bash
+- tar
+- gzip
+- unzip
+- jq
+
+Do not leave common prerequisites as manual README steps.
 
 During install, the bootstrap script must collect required environment values interactively, especially:
 - ADMIN_ID
