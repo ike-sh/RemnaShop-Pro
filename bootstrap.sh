@@ -474,9 +474,11 @@ confirm_uninstall_if_needed() {
   warn "- Compose 项目：${PROJECT_NAME}"
   warn "- 该项目创建的容器/镜像/数据卷"
   warn "- 项目目录：${INSTALL_DIR}"
-  printf "请输入 'YES' 确认卸载: " >/dev/tty
+  printf "请输入确认（YES/yes/Y/y）以继续卸载，其他任意输入将取消: " >/dev/tty
   read -r confirm </dev/tty
-  if [ "${confirm}" != "YES" ]; then
+  confirm="$(printf '%s' "${confirm}" | tr -d '[:space:]')"
+  confirm="$(printf '%s' "${confirm}" | tr '[:upper:]' '[:lower:]')"
+  if [ "${confirm}" != "yes" ] && [ "${confirm}" != "y" ]; then
     log "已取消卸载。"
     exit 0
   fi
