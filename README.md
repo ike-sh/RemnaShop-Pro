@@ -50,6 +50,36 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 5. 启动 Docker Compose 栈
 6. 打印启动验证与健康检查结果
 
+> `bootstrap.sh` 支持两种模式：
+> - 交互菜单（直接执行 `bash bootstrap.sh`）
+> - 非交互参数：`bash bootstrap.sh install` / `bash bootstrap.sh uninstall`
+
+---
+
+## 卸载（仅移除 RemnaShop-Pro 资源）
+
+### 非交互卸载（服务器本地脚本）
+
+```bash
+cd /opt/remnashop-pro
+bash bootstrap.sh uninstall
+```
+
+### 远程一行卸载（不经过菜单）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootstrap.sh | bash -s -- uninstall
+```
+
+卸载会**仅**清理以下 RemnaShop-Pro 资源：
+- Compose 项目 `remnashop`
+- 该项目创建的容器
+- 该项目创建的本地镜像（`--rmi local`）
+- 该项目创建的卷（`-v`）
+- 项目目录 `/opt/remnashop-pro`
+
+不会触碰其他 Compose 项目或无关 Docker 资源。
+
 ---
 
 ## 安装后验证（手动复核）
