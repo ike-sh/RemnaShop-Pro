@@ -184,3 +184,61 @@ async def bulk_move_users_to_squad(uuids, squad_uuid, panel_url, headers, verify
     # 兼容旧版 API：退回到 legacy bulk update 字段
     fallback_payload = {'uuids': uuids, 'fields': {'externalSquadUuid': squad_uuid}}
     return await safe_api_request('POST', '/users/bulk/update', panel_url, headers, verify_tls, json_data=fallback_payload)
+
+
+async def create_user(payload, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', '/users', panel_url, headers, verify_tls, json_data=payload)
+
+
+async def patch_user(payload, panel_url, headers, verify_tls=True):
+    return await safe_api_request('PATCH', '/users', panel_url, headers, verify_tls, json_data=payload)
+
+
+async def delete_user(uuid, panel_url, headers, verify_tls=True):
+    return await safe_api_request('DELETE', f"/users/{uuid}", panel_url, headers, verify_tls)
+
+
+async def enable_user(uuid, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', f"/users/{uuid}/actions/enable", panel_url, headers, verify_tls)
+
+
+async def disable_user(uuid, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', f"/users/{uuid}/actions/disable", panel_url, headers, verify_tls)
+
+
+async def reset_user_traffic(uuid, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', f"/users/{uuid}/actions/reset-traffic", panel_url, headers, verify_tls)
+
+
+async def get_subscription_request_history(panel_url, headers, verify_tls=True):
+    resp = await safe_api_request('GET', '/subscription-request-history', panel_url, headers, verify_tls)
+    if resp and resp.status_code == 200:
+        payload = extract_payload(resp)
+        return payload if isinstance(payload, list) else []
+    return []
+
+
+async def bulk_delete_users(uuids, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', '/users/bulk/delete', panel_url, headers, verify_tls, json_data={"uuids": uuids})
+
+
+async def bulk_reset_traffic_users(uuids, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', '/users/bulk/reset-traffic', panel_url, headers, verify_tls, json_data={"uuids": uuids})
+
+
+async def bulk_update_users(uuids, fields, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', '/users/bulk/update', panel_url, headers, verify_tls, json_data={"uuids": uuids, "fields": fields})
+
+
+async def probe_api_capabilities(panel_url, headers, verify_tls=True):
+    checks = {
+        "users_bulk_update_squads": ('POST', '/users/bulk/update-squads', {"uuids": [], "activeInternalSquads": []}),
+        "users_bulk_update": ('POST', '/users/bulk/update', {"uuids": [], "fields": {}}),
+        "users_bulk_delete": ('POST', '/users/bulk/delete', {"uuids": []}),
+        "subscription_history": ('GET', '/subscription-request-history', None),
+    }
+    result = {}
+    for key, (method, endpoint, payload) in checks.items():
+        resp = await safe_api_request(method, endpoint, panel_url, headers, verify_tls, json_data=payload)
+        result[key] = bool(resp and resp.status_code not in (404, 405))
+    return result

@@ -7,7 +7,7 @@ import asyncio
 import qrcode
 from io import BytesIO
 from collections import defaultdict
-from services.panel_api import safe_api_request as api_safe_request, get_panel_user as api_get_panel_user, get_user_by_telegram_id as api_get_user_by_telegram_id, get_nodes_status as api_get_nodes_status, get_subscription_history_stats as api_get_subscription_history_stats, get_user_subscription_history as api_get_user_subscription_history, get_subscription_settings as api_get_subscription_settings, patch_subscription_settings as api_patch_subscription_settings, get_internal_squads as api_get_internal_squads, get_internal_squad_accessible_nodes as api_get_internal_squad_accessible_nodes, get_bandwidth_nodes_realtime as api_get_bandwidth_nodes_realtime, bulk_move_users_to_squad as api_bulk_move_users_to_squad, close_all_clients, extract_payload
+from services.panel_api import safe_api_request as api_safe_request, get_panel_user as api_get_panel_user, get_user_by_telegram_id as api_get_user_by_telegram_id, get_nodes_status as api_get_nodes_status, get_subscription_history_stats as api_get_subscription_history_stats, get_user_subscription_history as api_get_user_subscription_history, get_subscription_settings as api_get_subscription_settings, patch_subscription_settings as api_patch_subscription_settings, get_internal_squads as api_get_internal_squads, get_internal_squad_accessible_nodes as api_get_internal_squad_accessible_nodes, get_bandwidth_nodes_realtime as api_get_bandwidth_nodes_realtime, bulk_move_users_to_squad as api_bulk_move_users_to_squad, create_user as api_create_user, patch_user as api_patch_user, delete_user as api_delete_user, enable_user as api_enable_user, disable_user as api_disable_user, reset_user_traffic as api_reset_user_traffic, get_subscription_request_history as api_get_subscription_request_history, bulk_delete_users as api_bulk_delete_users, probe_api_capabilities as api_probe_api_capabilities, close_all_clients, extract_payload
 from services.orders import (
     create_order,
     get_order,
@@ -30,6 +30,7 @@ from handlers.admin import format_order_detail, format_order_row, order_status_l
 from handlers.client import build_nodes_status_message
 from jobs.anomaly import build_anomaly_incidents
 from jobs.expiry import should_send_expire_notice
+from utils.constants import APP_VERSION, USER_STATUS_ACTIVE, USER_STATUS_LIMITED
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
@@ -73,6 +74,7 @@ user_cooldowns = {}
 COOLDOWN_SECONDS = 1.0
 uuid_map = {}
 order_payment_method_cache = {}
+panel_capabilities_cache = {}
 
 def get_short_id(real_uuid):
     for sid, uid in uuid_map.items():
@@ -341,7 +343,12 @@ async def safe_api_request(method, endpoint, json_data=None):
     if not PANEL_URL or not PANEL_TOKEN:
         logger.warning('panel config missing, skip request %s %s', method, endpoint)
         return None
-    return await api_safe_request(method, endpoint, PANEL_URL, get_headers(), PANEL_VERIFY_TLS, json_data=json_data)
+    start = time.time()
+    resp = await api_safe_request(method, endpoint, PANEL_URL, get_headers(), PANEL_VERIFY_TLS, json_data=json_data)
+    latency_ms = int((time.time() - start) * 1000)
+    status_code = resp.status_code if resp else None
+    logger.info("panel_call method=%s endpoint=%s status=%s latency_ms=%s", method, endpoint, status_code, latency_ms)
+    return resp
 
 
 async def get_panel_user(uuid):
@@ -385,6 +392,45 @@ async def get_bandwidth_nodes_realtime():
 
 async def bulk_move_users_to_squad(uuids, squad_uuid):
     return await api_bulk_move_users_to_squad(uuids, squad_uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def create_panel_user(payload):
+    return await api_create_user(payload, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def patch_panel_user(payload):
+    return await api_patch_user(payload, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def delete_panel_user(uuid):
+    return await api_delete_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def enable_panel_user(uuid):
+    return await api_enable_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def disable_panel_user(uuid):
+    return await api_disable_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def reset_panel_user_traffic(uuid):
+    return await api_reset_user_traffic(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def get_subscription_request_history():
+    return await api_get_subscription_request_history(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def bulk_delete_panel_users(uuids):
+    return await api_bulk_delete_users(uuids, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def refresh_panel_capabilities():
+    global panel_capabilities_cache
+    panel_capabilities_cache = await api_probe_api_capabilities(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+    logger.info("Panel capabilities: %s", panel_capabilities_cache)
+    return panel_capabilities_cache
 
 
 async def build_squad_capacity_summary(max_users=60):
@@ -1720,7 +1766,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data.startswith("anomaly_quick_enable_"):
         uid = data.replace("anomaly_quick_enable_", "")
-        await safe_api_request('POST', f"/users/{uid}/actions/enable")
+        await enable_panel_user(uid)
         await query.answer("✅ 已尝试解封该用户", show_alert=False)
         return
     if data == "admin_plans_list":
@@ -1808,12 +1854,12 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await send_or_edit_menu(update, context, "\n".join(lines), InlineKeyboardMarkup(kb))
     elif data.startswith("reset_traffic_"):
         target_uuid = data.replace("reset_traffic_", "")
-        resp = await safe_api_request('POST', f"/users/{target_uuid}/actions/reset-traffic")
+        resp = await reset_panel_user_traffic(target_uuid)
         if resp and resp.status_code == 204: await query.answer("✅ 流量已重置", show_alert=True)
         else: await query.answer("❌ 操作失败", show_alert=True)
     elif data.startswith("confirm_del_user_"):
         target_uuid = data.replace("confirm_del_user_", "")
-        await safe_api_request('DELETE', f"/users/{target_uuid}")
+        await delete_panel_user(target_uuid)
         db_execute("DELETE FROM subscriptions WHERE uuid = ?", (target_uuid,))
         await query.answer("✅ 用户已删除", show_alert=True)
         await show_users_list(update, context)
@@ -2332,8 +2378,8 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "activeInternalSquads": [TARGET_GROUP_UUID],
                 "trafficLimitStrategy": reset_strategy,
             }
-            await safe_api_request('POST', f"/users/{target_uuid}/actions/enable")
-            r = await safe_api_request('PATCH', "/users", json_data=update_payload)
+            await enable_panel_user(target_uuid)
+            r = await patch_panel_user(update_payload)
             if r and r.status_code in [200, 204]:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_uuid=target_uuid)
                 append_order_audit_log(db_execute, order_id, 'deliver_success', query.from_user.id, 'renew')
@@ -2368,7 +2414,7 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "proxies": {},
                 "activeInternalSquads": [TARGET_GROUP_UUID],
             }
-            r = await safe_api_request('POST', "/users", json_data=payload)
+            r = await create_panel_user(payload)
             if r and r.status_code in [200, 201]:
                 resp_data = extract_payload(r)
                 user_uuid = resp_data.get('uuid')
@@ -2466,7 +2512,7 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
                         except Exception as exc:
                             logger.warning("Failed to send expiry notice to %s: %s", u_dict['tg_id'], exc)
                 if days_left == -1 and info.get('status') == 'active':
-                    await safe_api_request('POST', f"/users/{u_dict['uuid']}/actions/disable")
+                    await disable_panel_user(u_dict['uuid'])
                 if days_left < -cleanup_days:
                     to_delete_uuids.append(u_dict['uuid'])
                     db_execute("DELETE FROM subscriptions WHERE uuid = ?", (u_dict['uuid'],))
@@ -2479,7 +2525,7 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
     tasks = [check_single_sub(sub) for sub in subs]
     await asyncio.gather(*tasks)
     if to_delete_uuids:
-        await safe_api_request('POST', '/users/bulk/delete', json_data={"uuids": to_delete_uuids})
+        await bulk_delete_panel_users(to_delete_uuids)
 
 async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2495,7 +2541,7 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     added_ts = now_ts
                 if now_ts - added_ts >= auto_hours * 3600:
-                    resp = await safe_api_request('PATCH', '/users', json_data={"uuid": uid, "status": "ACTIVE"})
+                    resp = await patch_panel_user({"uuid": uid, "status": USER_STATUS_ACTIVE})
                     if resp and resp.status_code in (200, 201, 204):
                         changed = True
                         candidates.pop(uid, None)
@@ -2505,10 +2551,7 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
 
         val_thr = db_query("SELECT value FROM settings WHERE key='anomaly_threshold'", one=True)
         limit = int(val_thr['value']) if val_thr else 50
-        resp = await safe_api_request('GET', '/subscription-request-history')
-        if not resp or resp.status_code != 200:
-            return
-        logs = extract_payload(resp)
+        logs = await get_subscription_request_history()
         if not isinstance(logs, list) or not logs:
             return
 
@@ -2559,11 +2602,11 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
                 risk_level = '高'
                 if enforce_mode == 'enforce':
                     action_taken = '禁用'
-                    await safe_api_request('POST', f"/users/{uid}/actions/disable")
+                    await disable_panel_user(uid)
                     unfreeze_candidates.pop(uid, None)
                 elif enforce_mode == 'gray':
                     action_taken = '限速(灰度)'
-                    await safe_api_request('PATCH', '/users', json_data={"uuid": uid, "status": "LIMITED"})
+                    await patch_panel_user({"uuid": uid, "status": USER_STATUS_LIMITED})
                     unfreeze_candidates[uid] = int(time.time())
                 else:
                     action_taken = '仅告警(观察)'
@@ -2572,7 +2615,7 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
                 risk_level = '中'
                 if enforce_mode == 'enforce':
                     action_taken = '限速'
-                    await safe_api_request('PATCH', '/users', json_data={"uuid": uid, "status": "LIMITED"})
+                    await patch_panel_user({"uuid": uid, "status": USER_STATUS_LIMITED})
                     unfreeze_candidates[uid] = int(time.time())
                 else:
                     action_taken = '仅告警(灰度/观察)'
@@ -2667,8 +2710,10 @@ if __name__ == '__main__':
             if interval_sec > 0:
                 loop = asyncio.get_event_loop()
                 loop.create_task(reschedule_anomaly_job(app, val_int['value']))
+        if panel_config_ready():
+            asyncio.get_event_loop().create_task(refresh_panel_capabilities())
     except Exception as exc:
         logger.warning("Failed to reschedule anomaly job at startup: %s", exc)
 
-    print(f"🚀 RemnaShop-Pro V3.6 已启动 | 监听中...")
+    print(f"🚀 RemnaShop-Pro {APP_VERSION} 已启动 | 监听中...")
     app.run_polling()
