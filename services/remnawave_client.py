@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,12 +29,14 @@ class RemnawaveApiClient:
         base_url: str,
         token: str | None = None,
         spec_path: str | Path = DEFAULT_OPENAPI_PATH,
+        spec_data: dict[str, Any] | None = None,
         timeout: float = 20.0,
         verify_tls: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token or ""
         self.spec_path = Path(spec_path)
+        self.spec_data = spec_data
         self.timeout = timeout
         self.verify_tls = verify_tls
         self.spec = self._load_spec()
@@ -47,9 +50,16 @@ class RemnawaveApiClient:
             self._client = None
 
     def _load_spec(self) -> dict[str, Any]:
-        if not self.spec_path.exists():
-            raise FileNotFoundError(f"OpenAPI spec not found: {self.spec_path}")
-        with self.spec_path.open("r", encoding="utf-8") as f:
+        if isinstance(self.spec_data, dict):
+            return self.spec_data
+        env_path = os.getenv("REMNAWAVE_OPENAPI_PATH", "").strip()
+        candidates = [Path(env_path)] if env_path else []
+        candidates.extend([self.spec_path, Path("docs/openapi.json")])
+        real_path = next((p for p in candidates if p and p.exists()), None)
+        if real_path is None:
+            hint = ", ".join(str(p) for p in candidates if p)
+            raise FileNotFoundError(f"OpenAPI spec not found. Tried: {hint}")
+        with real_path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
     def _build_operations(self) -> dict[str, OperationSpec]:

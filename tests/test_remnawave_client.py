@@ -41,7 +41,14 @@ class TestRemnawaveClient(unittest.IsolatedAsyncioTestCase):
             await client.call_auth_operation("getUserByUuid")
         await client.aclose()
 
+    def test_support_spec_data_without_file(self):
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {"/auth/login": {"post": {"operationId": "authLogin", "tags": ["auth"]}}},
+        }
+        client = RemnawaveApiClient(base_url="https://example.com/api", spec_data=spec, spec_path="missing.json")
+        self.assertEqual(len(client.get_auth_operations()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-
