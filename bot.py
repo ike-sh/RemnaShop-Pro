@@ -741,98 +741,7 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data == "client_pay_done_upload":
-        pending = get_pending_order_for_user(db_query, user_id)
-        if not pending:
-            await query.answer("当前没有待提交审核的订单", show_alert=True)
-            return
-
-        pay_method = order_payment_method_cache.get(pending['order_id'], 'alipay')
-        pay_state = resolve_payment_state(pay_method)
-        if not pay_state['available']:
-            await query.answer("当前支付方式不可用，请等待管理员配置收款。", show_alert=True)
-            return
-
-        proof = context.user_data.get('pending_payment_proof')
-        if not proof or proof.get('order_id') != pending['order_id']:
-            await query.answer("请先发送支付截图/文件/口令，再点击此按钮提交。", show_alert=True)
-            return
-
-        plan = db_query("SELECT * FROM plans WHERE key = ?", (pending['plan_key'],), one=True)
-        if not plan:
-            await query.answer("订单套餐已失效，请重新下单", show_alert=True)
-            update_order_status(db_execute, pending['order_id'], [STATUS_PENDING], STATUS_FAILED, error_message='plan_deleted')
-            context.user_data.pop('pending_payment_proof', None)
-            return
-
-        t_str = "续费" if pending['order_type'] == 'renew' else "新购"
-        pay_label = "支付宝" if pay_method == 'alipay' else "微信支付"
-        target_uuid = pending['target_uuid'] if pending['target_uuid'] else "0"
-        sid = get_short_id(target_uuid) if target_uuid != "0" else "0"
-        kb = [
-            [InlineKeyboardButton("✅ 通过", callback_data=f"ap_{pending['order_id']}_{sid}")],
-            [InlineKeyboardButton("❌ 拒绝", callback_data=f"rj_{pending['order_id']}")],
-            [InlineKeyboardButton("📨 给用户发消息", callback_data=f"reply_user_{user_id}_{pending['order_id']}")],
-        ]
-
-        proof_type = proof.get('type')
-        proof_text = proof.get('text') or '[图片/文件]'
-        admin_message = None
-        if proof_type == 'text':
-            escaped_text = escape_markdown_v2(proof_text)
-            admin_msg = (
-                f"*💰 审核 {escape_markdown_v2(t_str)}*\n"
-                f"👤 用户ID: `{user_id}`\n"
-                f"📦 套餐: `{escape_markdown_v2(dict(plan)['name'])}`\n"
-                f"💳 支付方式: `{escape_markdown_v2(pay_label)}`\n"
-                f"🏷 渠道码: `{escape_markdown_v2(str(pending.get('channel_code') or '-'))}`\n"
-                f"📝 口令/说明: `{escaped_text}`"
-            )
-            admin_message = await context.bot.send_message(
-                ADMIN_ID,
-                admin_msg,
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode='MarkdownV2',
-            )
-        else:
-            caption = (
-                f"💰 审核 {t_str}\n"
-                f"👤 用户ID: {user_id}\n"
-                f"📦 套餐: {dict(plan)['name']}\n"
-                f"💳 支付方式: {pay_label}\n"
-                f"🏷 渠道码: {pending.get('channel_code') or '-'}\n"
-                f"📎 用户已提交支付凭证图片/文件"
-            )
-            if proof_type == 'photo' and proof.get('file_id'):
-                admin_message = await context.bot.send_photo(
-                    ADMIN_ID,
-                    photo=proof['file_id'],
-                    caption=caption,
-                    reply_markup=InlineKeyboardMarkup(kb),
-                )
-            elif proof_type == 'document' and proof.get('file_id'):
-                admin_message = await context.bot.send_document(
-                    ADMIN_ID,
-                    document=proof['file_id'],
-                    caption=caption,
-                    reply_markup=InlineKeyboardMarkup(kb),
-                )
-
-        if not admin_message:
-            await query.answer("凭证读取失败，请重新发送后再提交", show_alert=True)
-            return
-
-        context.user_data.pop('pending_payment_proof', None)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        msg_obj = await query.message.reply_text(
-            "✅ 已提交，等待管理员审核。",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]),
-        )
-        attach_admin_message(db_execute, pending['order_id'], admin_message.message_id)
-        attach_payment_text(db_execute, pending['order_id'], f"方式:{pay_label}|{proof_text}", waiting_message_id=msg_obj.message_id)
-        await query.answer("提交成功", show_alert=True)
+        await query.answer("✅ 已切换为“发送凭证即提交审核”，请直接发送支付凭证。", show_alert=True)
         return
 
 
@@ -1039,15 +948,17 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         await show_payment_method_menu(update, context, plan_key, order_type, short_id)
 
-    elif data.startswith("paymethod_"):
-        # paymethod_{alipay|wechat}_{plan_key}_{order_type}_{short_id}
-        parts = data.split("_", 4)
-        if len(parts) < 5:
-            logger.warning("Invalid paymethod callback payload: %s", data)
-            await query.answer("参数错误")
+    elif data.startswith("manualreview_"):
+        parts = data.split("_", 3)
+        if len(parts) < 4:
+            logger.warning("Invalid manualreview callback payload: %s", data)
+            await query.answer("参数错误", show_alert=True)
             return
-        _, pay_method, plan_key, order_type, short_id = parts
-        await handle_order_confirmation(update, context, plan_key, order_type, short_id, payment_method=pay_method)
+        _, plan_key, order_type, short_id = parts
+        await handle_order_confirmation(update, context, plan_key, order_type, short_id, payment_method='manual_review')
+
+    elif data.startswith("paymethod_"):
+        await query.answer("当前仅支持人工审核流程，请返回重试。", show_alert=True)
 
     elif data == "cancel_order":
         pending = get_pending_order_for_user(db_query, user_id)
@@ -1062,31 +973,90 @@ async def show_payment_method_menu(update, context, plan_key, order_type, short_
         await send_or_edit_menu(update, context, "⚠️ 套餐不存在或已下架，请返回重新选择。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
         return
     plan_dict = dict(plan)
-    usdt_plan_ready = bool(str(plan_dict.get('usdt_price') or '').strip())
 
     type_str = "续费" if order_type == 'renew' else "新购"
 
-    if not is_any_payment_available():
-        msg = "⚠️ 管理员未配置收款，请等待管理配置收款。"
-        kb = [[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]
-        await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
-        return
-
-    msg = f"💳 **选择支付方式（{type_str}）**\n请选择收款方式："
-    kb = []
-    if resolve_payment_state('alipay')['available']:
-        kb.append([InlineKeyboardButton("🟦 支付宝", callback_data=f"paymethod_alipay_{plan_key}_{order_type}_{short_id}")])
-    if resolve_payment_state('wechat')['available']:
-        kb.append([InlineKeyboardButton("🟩 微信支付", callback_data=f"paymethod_wechat_{plan_key}_{order_type}_{short_id}")])
-    if resolve_payment_state('usdt')['available'] and usdt_plan_ready:
-        kb.append([InlineKeyboardButton("🟨 USDT", callback_data=f"paymethod_usdt_{plan_key}_{order_type}_{short_id}")])
-    if not kb:
-        msg = "⚠️ 当前套餐暂无可用收款方式（USDT 需要先配置该套餐的 USDT 金额）。"
-        kb = [[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]
-        await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
-        return
+    msg = (
+        f"🧾 **下单确认（{type_str}）**\n"
+        f"📦 套餐：{plan_dict['name']}\n"
+        f"💰 金额：{plan_dict.get('price')}\n"
+        f"📡 流量：{plan_dict.get('gb')} GB\n\n"
+        "请选择下一步："
+    )
+    kb = [[InlineKeyboardButton("🧾 人工审核", callback_data=f"manualreview_{plan_key}_{order_type}_{short_id}")]]
     kb.append([InlineKeyboardButton("🔙 返回", callback_data="back_home")])
     await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(update, Update) and update.callback_query:
+        callback_data = update.callback_query.data
+        user_id = update.callback_query.from_user.id
+        logger.exception("Unhandled callback exception: user_id=%s callback_data=%s error=%s", user_id, callback_data, err)
+        try:
+            await update.callback_query.answer("⚠️ 系统异常，请稍后重试。", show_alert=True)
+        except Exception:
+            pass
+        return
+    logger.exception("Unhandled telegram update exception: %s", err)
+
+async def submit_manual_review_proof(update: Update, context: ContextTypes.DEFAULT_TYPE, pending_order: dict, proof: dict):
+    user_id = int(pending_order['tg_id'])
+    order_id = pending_order['order_id']
+    plan = db_query("SELECT * FROM plans WHERE key = ?", (pending_order['plan_key'],), one=True)
+    if not plan:
+        update_order_status(db_execute, order_id, [STATUS_PENDING], STATUS_FAILED, error_message='plan_deleted')
+        await update.message.reply_text("❌ 套餐已失效，订单已关闭，请重新下单。")
+        return
+
+    plan_dict = dict(plan)
+    strategy_label = get_strategy_label(plan_dict.get('reset_strategy', 'NO_RESET'))
+    type_str = "续费" if pending_order['order_type'] == 'renew' else "新购"
+    target_uuid = pending_order['target_uuid'] if pending_order['target_uuid'] else "0"
+    sid = get_short_id(target_uuid) if target_uuid != "0" else "0"
+    username = update.effective_user.username or "-"
+    proof_type = proof.get('type')
+    proof_text = (proof.get('text') or '').strip()
+    if not proof_text:
+        proof_text = "[图片/文件]"
+
+    kb = [
+        [InlineKeyboardButton("✅ 通过", callback_data=f"ap_{order_id}_{sid}")],
+        [InlineKeyboardButton("❌ 拒绝", callback_data=f"rj_{order_id}")],
+        [InlineKeyboardButton("📨 给用户发消息", callback_data=f"reply_user_{user_id}_{order_id}")],
+    ]
+    caption = (
+        f"🧾 人工审核订单\n"
+        f"🆔 订单号: {order_id}\n"
+        f"👤 用户ID: {user_id} (@{username})\n"
+        f"📦 套餐: {plan_dict['name']}\n"
+        f"💰 金额: {plan_dict.get('price')}\n"
+        f"📡 流量: {plan_dict.get('gb')} GB ({strategy_label})\n"
+        f"🧩 类型: {type_str}\n"
+        f"🏷 渠道码: {pending_order.get('channel_code') or '-'}\n"
+        f"📝 用户凭证: {proof_text}"
+    )
+
+    admin_message = None
+    if proof_type == 'text':
+        admin_message = await context.bot.send_message(ADMIN_ID, caption, reply_markup=InlineKeyboardMarkup(kb))
+    elif proof_type == 'photo' and proof.get('file_id'):
+        admin_message = await context.bot.send_photo(ADMIN_ID, photo=proof['file_id'], caption=caption, reply_markup=InlineKeyboardMarkup(kb))
+    elif proof_type == 'document' and proof.get('file_id'):
+        admin_message = await context.bot.send_document(ADMIN_ID, document=proof['file_id'], caption=caption, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.message.reply_text("⚠️ 未识别的凭证格式，请发送文字、图片或文件。")
+        return
+
+    append_order_audit_log(db_execute, order_id, 'submit_manual_review', user_id, f"proof_type={proof_type}")
+    attach_admin_message(db_execute, order_id, admin_message.message_id)
+    attach_payment_text(db_execute, order_id, f"方式:人工审核|{proof_text}")
+    context.user_data.pop('pending_payment_proof', None)
+    context.user_data.pop('awaiting_manual_review_proof_order_id', None)
+    await update.message.reply_text(
+        "✅ 已提交人工审核，请等待管理员处理。",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]),
+    )
 
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
@@ -1113,33 +1083,7 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
     plan_dict = dict(plan)
     strategy = plan_dict.get('reset_strategy', 'NO_RESET')
     strategy_label = get_strategy_label(strategy)
-
     type_str = "续费" if order_type == 'renew' else "新购"
-    back_data = f"view_sub_{short_id}" if order_type == 'renew' else "client_buy_new"
-    keyboard = [
-        [InlineKeyboardButton("❌ 取消订单", callback_data="cancel_order")],
-        [InlineKeyboardButton("🔙 返回", callback_data=back_data)],
-    ]
-
-    pay_state = resolve_payment_state(payment_method)
-    method_label = pay_state['method_label']
-    pay_tip = pay_state['pay_tip']
-    should_send_qr = pay_state['should_send_qr']
-    qr_file_id = pay_state['qr_file_id']
-
-    show_price = get_plan_price(plan_dict, payment_method)
-    msg = (
-        f"📝 **订单确认 ({type_str})**\n"
-        f"📦 套餐：{plan_dict['name']}\n"
-        f"💰 金额：**{show_price}**\n"
-        f"📡 流量：**{plan_dict['gb']} GB ({strategy_label})**\n"
-        f"💳 支付方式：**{method_label}**\n\n"
-        f"💳 **下一步：**\n{pay_tip}"
-    )
-
-    if not pay_state['available']:
-        await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
-        return
 
     msg_id = None
     if update.callback_query and update.callback_query.message:
@@ -1148,39 +1092,24 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
     order, created = create_order(db_query, db_execute, user_id, plan_key, order_type, target_uuid, menu_message_id=msg_id, channel_code=context.user_data.get('channel_code'))
     if created:
         append_order_audit_log(db_execute, order['order_id'], 'create', user_id, f"type={order_type};plan={plan_key};channel={context.user_data.get('channel_code') or '-'}")
-        order_payment_method_cache[order["order_id"]] = payment_method
+        order_payment_method_cache[order["order_id"]] = "manual_review"
+        context.user_data['awaiting_manual_review_proof_order_id'] = order['order_id']
         context.user_data.pop('pending_payment_proof', None)
     else:
         msg = "⚠️ 你已有一个待审核订单，请先等待管理员处理，或取消后重新下单。"
-        await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(keyboard))
+        await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
         return
-
-    if should_send_qr and qr_file_id:
-        try:
-            await context.bot.send_photo(
-                chat_id=user_id,
-                photo=qr_file_id,
-                caption=f"{msg}\n\n👇 请先发送支付凭证，发送后系统会出现提交按钮。",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-            if update.callback_query and update.callback_query.message:
-                try:
-                    await update.callback_query.message.delete()
-                except Exception:
-                    pass
-            return
-        except Exception as exc:
-            logger.warning("发送收款码失败: %s", exc)
-            msg += "\n\n⚠️ 当前收款码未能发送，请联系管理员。"
-
-    msg += "\n\n👇 请先发送支付凭证，发送后系统会出现提交按钮。"
-    await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(keyboard))
-    if created and qr_file_id:
-        try:
-            await context.bot.send_photo(chat_id=user_id, photo=qr_file_id, caption=f"📌 当前收款码：{method_label}")
-        except Exception as exc:
-            logger.warning("发送收款码失败: %s", exc)
+    msg = (
+        f"📝 **订单已创建（人工审核）**\n"
+        f"🆔 订单号：`{order['order_id']}`\n"
+        f"📦 套餐：{plan_dict['name']}\n"
+        f"💰 金额：**{plan_dict.get('price')}**\n"
+        f"📡 流量：**{plan_dict['gb']} GB ({strategy_label})**\n"
+        f"🧩 类型：**{type_str}**\n\n"
+        "👇 请直接在聊天中发送支付凭证（文字说明、截图、图片或文件），发送后会自动提交人工审核。"
+    )
+    kb = [[InlineKeyboardButton("❌ 取消订单", callback_data="cancel_order")], [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]
+    await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
 
 async def show_plans_menu(update, context):
     plans = db_query("SELECT * FROM plans")
@@ -2375,6 +2304,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending_order = get_pending_order_for_user(db_query, user_id)
     if pending_order:
+        awaiting_order_id = context.user_data.get('awaiting_manual_review_proof_order_id')
+        if awaiting_order_id and awaiting_order_id != pending_order['order_id']:
+            logger.warning("awaiting order mismatch: user=%s expected=%s actual=%s", user_id, awaiting_order_id, pending_order['order_id'])
         proof = None
         if text and text.strip():
             proof = {'type': 'text', 'text': text.strip()}
@@ -2392,13 +2324,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         proof['order_id'] = pending_order['order_id']
         context.user_data['pending_payment_proof'] = proof
-        await update.message.reply_text(
-            "✅ 已收到支付凭证，请点击下方按钮提交给管理员审核。",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📨 提交审核", callback_data="client_pay_done_upload")],
-                [InlineKeyboardButton("❌ 取消订单", callback_data="cancel_order")],
-            ]),
-        )
+        await submit_manual_review_proof(update, context, pending_order, proof)
         return
 
 async def add_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2427,6 +2353,10 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.delete_message(chat_id=uid, message_id=menu_message_id)
             except Exception as exc:
                 logger.debug("failed to delete menu message for uid=%s order=%s: %s", uid, order_record.get('order_id'), exc)
+        db_execute(
+            "UPDATE orders SET waiting_message_id=NULL, menu_message_id=NULL, updated_at=? WHERE order_id=?",
+            (int(time.time()), order_record.get('order_id')),
+        )
     if data.startswith("review_"):
         parts = data.split("_")
         if len(parts) >= 5:
@@ -2888,6 +2818,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^client_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^selrenew_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^order_"))
+    app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^manualreview_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^paymethod_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^cancel_order"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^back_home$"))
