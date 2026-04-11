@@ -49,9 +49,17 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 3. 检查并安装 Docker Compose 插件（缺失时）
 4. 克隆/更新仓库到 `/opt/remnashop-pro`
 5. 若 `.env` 不存在则基于 `.env.example` 自动创建
-6. 交互收集必填 `ADMIN_ID` 与 `BOT_TOKEN`（已有值可选择保留或替换），并自动写入 `.env`
+6. 使用中文交互收集必填 `ADMIN_ID` 与 `BOT_TOKEN`（已有值可选择保留或替换），并自动写入 `.env`
 7. 启动 Docker Compose 栈
 8. 等待 `remnashop` 容器健康状态变为 `healthy` 后才报告安装成功
+
+示例交互（节选）：
+
+```text
+[remnashop-bootstrap] 正在配置必填环境变量（仅 ADMIN_ID 与 BOT_TOKEN）。
+请输入 ADMIN_ID:
+请输入 BOT_TOKEN:
+```
 
 > `bootstrap.sh` 支持两种模式：
 > - 交互菜单（直接执行 `bash bootstrap.sh`）
@@ -84,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 不会触碰其他 Compose 项目或无关 Docker 资源。
 
 > 卸载安全行为：
-> - 检测到交互终端时，必须手动输入 `YES` 才会执行删除；
+> - 检测到交互终端时，必须手动确认才会执行删除（支持 `YES` / `yes` / `Y` / `y`）；
 > - 非交互场景（如远程 `curl | bash -s -- uninstall`）会跳过确认，但仍只针对 `remnashop` 项目资源操作；
 > - 卸载为幂等操作：资源已不存在时只给出提示，不会报错中断。
 
@@ -141,17 +149,32 @@ cd /opt/remnashop-pro
 - `ADMIN_ID`
 - `BOT_TOKEN`
 
+`.env.example` 中这两个字段默认是空值（`ADMIN_ID=`、`BOT_TOKEN=`），用于确保首次安装必须由管理员输入真实值。
+
 若 `.env` 已存在，脚本会展示当前值，并询问你“保留还是替换”。
+若 `.env` 来自模板且 `ADMIN_ID` / `BOT_TOKEN` 为空，脚本会直接要求输入新值，不会询问“是否保留空值”。
 脚本会校验 `ADMIN_ID` 与 `BOT_TOKEN` 不可为空，否则不会继续部署。
 脚本通过 `/dev/tty` 进行交互输入；若当前执行环境无可用 TTY，则会明确报错并提示先在 `.env` 预置必填值后再执行安装。
 
-建议一并配置：
+以下变量在安装阶段均为可选，不会阻塞部署；可后续在机器人/应用内配置：
 
 - `PANEL_URL`
 - `PANEL_TOKEN`
 - `SUB_DOMAIN`
 - `GROUP_UUID`
 - `PANEL_VERIFY_TLS`
+
+## 生产镜像构建说明
+
+生产镜像通过 `.dockerignore` 排除非运行时文件，不会打包以下内容：
+
+- `tests/`
+- `docs/`
+- `README.md`
+- `AGENTS.md`
+- `LICENSE`
+- `.gitignore`
+- `.env.example`
 
 ---
 
