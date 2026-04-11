@@ -260,11 +260,11 @@ async def _request_first_success(candidates, panel_url, headers, verify_tls=True
 
 
 async def set_user_metadata(user_uuid, metadata: dict[str, Any], panel_url, headers, verify_tls=True):
-    payload = {"userUuid": user_uuid, "metadata": metadata}
+    payload = {"metadata": metadata}
     candidates = [
-        ('POST', '/metadata/user'),
-        ('PUT', '/metadata/user'),
-        ('PATCH', '/metadata/user'),
+        ('PUT', f'/metadata/user/{user_uuid}'),
+        ('PATCH', f'/metadata/user/{user_uuid}'),
+        ('POST', f'/metadata/user/{user_uuid}'),
     ]
     return await _request_first_success(candidates, panel_url, headers, verify_tls, json_data=payload)
 
