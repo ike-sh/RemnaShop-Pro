@@ -46,9 +46,10 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 1. 检查并安装 Docker（缺失时）
 2. 检查并安装 Docker Compose（缺失时）
 3. 克隆/更新仓库到 `/opt/remnashop-pro`
-4. 基于 `.env.example` 准备 `.env`
-5. 启动 Docker Compose 栈
-6. 打印启动验证与健康检查结果
+4. 若 `.env` 不存在则基于 `.env.example` 自动创建
+5. 交互收集必填 `ADMIN_ID` 与 `BOT_TOKEN`（已有值可选择保留或替换），并自动写入 `.env`
+6. 启动 Docker Compose 栈
+7. 等待 `remnashop` 容器健康状态变为 `healthy` 后才报告安装成功
 
 > `bootstrap.sh` 支持两种模式：
 > - 交互菜单（直接执行 `bash bootstrap.sh`）
@@ -80,23 +81,33 @@ curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootst
 
 不会触碰其他 Compose 项目或无关 Docker 资源。
 
+> 卸载安全行为：
+> - 检测到交互终端时，必须手动输入 `YES` 才会执行删除；
+> - 非交互场景（如远程 `curl | bash -s -- uninstall`）会跳过确认，但仍只针对 `remnashop` 项目资源操作；
+> - 卸载为幂等操作：资源已不存在时只给出提示，不会报错中断。
+
 ---
 
-## 安装后验证（手动复核）
+## 安装成功判定与失败排查
 
-进入部署目录：
+安装脚本的**成功判定**不是 `docker compose up -d` 返回成功，而是：
+
+- `remnashop` 容器实际进入 `health=healthy` 状态。
+
+若出现以下情况会直接判定安装失败并给出日志排查提示：
+- 容器退出（`exited/dead`）
+- 健康检查 `unhealthy`
+- 容器持续重启（`restarting` 或重启次数异常增长）
+- 在超时时间内未进入 `healthy`
+
+手动复核命令：
 
 ```bash
 cd /opt/remnashop-pro
-```
-
-执行：
-
-```bash
 docker --version
 docker compose version
 test -f .env && echo ".env exists"
-docker compose ps
+docker compose -p remnashop ps
 docker compose logs --tail=100 remnashop
 ```
 
@@ -104,7 +115,7 @@ docker compose logs --tail=100 remnashop
 - `docker --version` 能输出版本号
 - `docker compose version` 能输出版本号
 - `.env exists` 输出成功
-- `docker compose ps` 显示 `remnashop` 服务在运行中（初始化阶段可能显示 `starting`）
+- `docker compose -p remnashop ps` 显示 `remnashop` 服务为 `running` 且健康检查最终为 `healthy`
 - 日志中无持续崩溃重启
 
 ---
@@ -123,10 +134,12 @@ cd /opt/remnashop-pro
 
 ## 环境变量说明
 
-首次安装会自动从 `.env.example` 生成 `.env`（若不存在）。请至少配置：
+首次安装会自动从 `.env.example` 生成 `.env`（若不存在），并在安装过程中交互收集并写入以下必填项：
 
 - `ADMIN_ID`
 - `BOT_TOKEN`
+
+若 `.env` 已存在，脚本会展示当前值，并询问你“保留还是替换”。
 
 建议一并配置：
 

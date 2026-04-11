@@ -26,12 +26,14 @@ err() {
 usage() {
   cat <<USAGE
 Usage:
-  bash bootstrap.sh install      # non-interactive install
-  bash bootstrap.sh uninstall    # non-interactive uninstall
+  bash bootstrap.sh install
+  bash bootstrap.sh uninstall
   bash bootstrap.sh              # interactive menu when TTY is available; otherwise defaults to install
 
 Public one-command install:
   curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootstrap.sh | bash
+Public one-command uninstall:
+  curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootstrap.sh | bash -s -- uninstall
 USAGE
 }
 
@@ -127,10 +129,165 @@ prepare_env() {
   fi
 }
 
+get_env_value() {
+  local key="$1"
+  local env_file="${INSTALL_DIR}/.env"
+  [ -f "${env_file}" ] || return 0
+  awk -F= -v k="${key}" '$1==k {sub(/^[^=]*=/, "", $0); print; exit}' "${env_file}"
+}
+
+upsert_env_value() {
+  local key="$1"
+  local value="$2"
+  local env_file="${INSTALL_DIR}/.env"
+  local escaped
+  escaped="$(printf '%s' "${value}" | sed 's/[\/&]/\\&/g')"
+
+  if grep -qE "^${key}=" "${env_file}"; then
+    sed -i "s/^${key}=.*/${key}=${escaped}/" "${env_file}"
+  else
+    printf '\n%s=%s\n' "${key}" "${value}" >>"${env_file}"
+  fi
+}
+
+input_fd() {
+  if [ -t 0 ]; then
+    echo "/dev/stdin"
+  elif { exec 3</dev/tty; } 2>/dev/null; then
+    echo "/dev/fd/3"
+  else
+    echo ""
+  fi
+}
+
+prompt_required_env() {
+  local fd
+  fd="$(input_fd)"
+  if [ -z "${fd}" ]; then
+    err "Interactive input is required to set ADMIN_ID and BOT_TOKEN, but no TTY is available."
+    err "Run on a terminal or preconfigure ${INSTALL_DIR}/.env before install."
+    exit 1
+  fi
+
+  local admin_current bot_current admin_new bot_new keep
+  admin_current="$(get_env_value "ADMIN_ID")"
+  bot_current="$(get_env_value "BOT_TOKEN")"
+
+  echo
+  log "Configure required environment values."
+
+  if [ -n "${admin_current}" ]; then
+    read -r -p "Existing ADMIN_ID='${admin_current}'. Keep it? [Y/n]: " keep <"${fd}"
+    if [[ ! "${keep:-Y}" =~ ^[Yy]$ ]]; then
+      while true; do
+        read -r -p "Enter ADMIN_ID: " admin_new <"${fd}"
+        if [ -n "${admin_new}" ]; then
+          upsert_env_value "ADMIN_ID" "${admin_new}"
+          break
+        fi
+        warn "ADMIN_ID cannot be empty."
+      done
+    fi
+  else
+    while true; do
+      read -r -p "Enter ADMIN_ID: " admin_new <"${fd}"
+      if [ -n "${admin_new}" ]; then
+        upsert_env_value "ADMIN_ID" "${admin_new}"
+        break
+      fi
+      warn "ADMIN_ID cannot be empty."
+    done
+  fi
+
+  if [ -n "${bot_current}" ]; then
+    read -r -p "Existing BOT_TOKEN='${bot_current}'. Keep it? [Y/n]: " keep <"${fd}"
+    if [[ ! "${keep:-Y}" =~ ^[Yy]$ ]]; then
+      while true; do
+        read -r -p "Enter BOT_TOKEN: " bot_new <"${fd}"
+        if [ -n "${bot_new}" ]; then
+          upsert_env_value "BOT_TOKEN" "${bot_new}"
+          break
+        fi
+        warn "BOT_TOKEN cannot be empty."
+      done
+    fi
+  else
+    while true; do
+      read -r -p "Enter BOT_TOKEN: " bot_new <"${fd}"
+      if [ -n "${bot_new}" ]; then
+        upsert_env_value "BOT_TOKEN" "${bot_new}"
+        break
+      fi
+      warn "BOT_TOKEN cannot be empty."
+    done
+  fi
+
+  if [ -z "$(get_env_value "ADMIN_ID")" ] || [ -z "$(get_env_value "BOT_TOKEN")" ]; then
+    err "ADMIN_ID and BOT_TOKEN must both be set in ${INSTALL_DIR}/.env."
+    [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
+    exit 1
+  fi
+
+  [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
+}
+
 start_stack() {
   cd "${INSTALL_DIR}"
   log "Starting Docker Compose stack..."
   docker compose -p "${PROJECT_NAME}" up -d --build
+}
+
+print_failure_hint() {
+  cat <<MSG
+
+❌ Install failed: remnashop container did not become healthy.
+Troubleshooting:
+  cd ${INSTALL_DIR}
+  docker compose -p ${PROJECT_NAME} ps
+  docker compose -p ${PROJECT_NAME} logs --tail=200 remnashop
+
+MSG
+}
+
+wait_for_health() {
+  cd "${INSTALL_DIR}"
+
+  local timeout="${HEALTH_TIMEOUT_SECONDS:-300}"
+  local elapsed=0
+  local interval=5
+  local container_id state health restart_count
+
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    container_id="$(docker compose -p "${PROJECT_NAME}" ps -q remnashop || true)"
+    if [ -z "${container_id}" ]; then
+      err "remnashop container not found."
+      print_failure_hint
+      return 1
+    fi
+
+    state="$(docker inspect --format='{{.State.Status}}' "${container_id}" 2>/dev/null || echo "unknown")"
+    health="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "${container_id}" 2>/dev/null || echo "unknown")"
+    restart_count="$(docker inspect --format='{{.RestartCount}}' "${container_id}" 2>/dev/null || echo "0")"
+
+    if [ "${state}" = "running" ] && [ "${health}" = "healthy" ]; then
+      log "remnashop container is healthy."
+      return 0
+    fi
+
+    if [ "${state}" = "exited" ] || [ "${state}" = "dead" ] || [ "${health}" = "unhealthy" ] || [ "${state}" = "restarting" ] || [ "${restart_count}" -gt 3 ]; then
+      err "Container state indicates failure (state=${state}, health=${health}, restarts=${restart_count})."
+      print_failure_hint
+      return 1
+    fi
+
+    echo "[wait] remnashop state=${state}, health=${health}, restarts=${restart_count} (${elapsed}s/${timeout}s)"
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+
+  err "Timed out after ${timeout}s waiting for healthy remnashop container."
+  print_failure_hint
+  return 1
 }
 
 verify_stack() {
@@ -209,7 +366,10 @@ remove_project_directory() {
 }
 
 confirm_uninstall_if_needed() {
-  if [ "${NON_INTERACTIVE_UNINSTALL:-0}" = "1" ]; then
+  local fd
+  fd="$(input_fd)"
+  if [ -z "${fd}" ]; then
+    warn "No interactive TTY detected; proceeding without confirmation prompt."
     return
   fi
 
@@ -218,11 +378,13 @@ confirm_uninstall_if_needed() {
   warn "- compose project: ${PROJECT_NAME}"
   warn "- containers/images/volumes created by this project"
   warn "- directory: ${INSTALL_DIR}"
-  read -r -p "Type 'YES' to confirm uninstall: " confirm
+  read -r -p "Type 'YES' to confirm uninstall: " confirm <"${fd}"
   if [ "${confirm}" != "YES" ]; then
     log "Uninstall canceled."
+    [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
     exit 0
   fi
+  [ "${fd}" = "/dev/fd/3" ] && exec 3<&-
 }
 
 install_flow() {
@@ -239,7 +401,9 @@ install_flow() {
   install_compose_if_missing
   clone_or_update_repo
   prepare_env
+  prompt_required_env
   start_stack
+  wait_for_health
   verify_stack
 
   cat <<MSG
@@ -247,10 +411,12 @@ install_flow() {
 ✅ RemnaShop-Pro install completed.
 
 Install directory: ${INSTALL_DIR}
+Success criteria met:
+  - docker compose up completed
+  - remnashop container reached health=healthy
 Next steps:
-  1) Edit ${INSTALL_DIR}/.env if needed
-  2) Check status: cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} ps
-  3) Check logs:   cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} logs -f remnashop
+  1) Check status: cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} ps
+  2) Check logs:   cd ${INSTALL_DIR} && docker compose -p ${PROJECT_NAME} logs -f remnashop
 
 MSG
 }
@@ -318,11 +484,7 @@ main() {
   if [ "${ACTION}" = "install" ]; then
     install_flow
   elif [ "${ACTION}" = "uninstall" ]; then
-    if [ "${FROM_ARG}" = "1" ]; then
-      NON_INTERACTIVE_UNINSTALL=1 uninstall_flow
-    else
-      uninstall_flow
-    fi
+    uninstall_flow
   fi
 }
 
