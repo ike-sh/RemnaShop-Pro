@@ -12,6 +12,7 @@ from services.panel_api import PanelApiError, PanelContractError, AmbiguousPanel
 from services.panel_api import get_users_by_telegram_id as api_get_users_by_telegram_id
 from services.panel_api import subscription_settings_patch_from_current
 from services.panel_api import run_bulk_action as api_run_bulk_action
+from services import panel_api as v38_api
 from services.orders import (
     create_order,
     get_order,
@@ -26,12 +27,15 @@ from services.orders import (
     STATUS_REJECTED,
     STATUS_DELIVERED,
     STATUS_FAILED,
+    STATUS_UNKNOWN,
+    STATUS_EXTENSION_APPLIED,
 )
-from storage.db import init_db as storage_init_db, db_query as storage_db_query, db_execute as storage_db_execute, bind_legacy_subscription
+from storage.db import init_db as storage_init_db, db_query as storage_db_query, db_execute as storage_db_execute, bind_legacy_subscription, create_action_request, get_action_request, claim_action_request, finish_action_request
 from utils.formatting import escape_markdown_v2
-from handlers.bulk_actions import parse_user_ids, parse_expire_days_and_user_ids, parse_traffic_and_user_ids
+from handlers.bulk_actions import parse_user_ids, parse_user_ids_strict, parse_extend_days_and_user_ids, parse_expire_days_and_user_ids, parse_traffic_and_user_ids
 from handlers.admin import format_order_detail, format_order_row, order_status_label
 from handlers.client import build_nodes_status_message
+from handlers.v38_views import device_summary, dashboard_summary, node_metrics_summary, http_stats_summary, geocheck_summary, top_hwid_users_summary, fit_message
 from jobs.anomaly import build_anomaly_incidents
 from jobs.expiry import should_send_expire_notice
 from utils.constants import APP_VERSION, USER_STATUS_ACTIVE, USER_STATUS_LIMITED, USER_STATUS_DISABLED
@@ -509,8 +513,8 @@ async def create_panel_user(payload):
     return await api_create_user(payload, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def patch_panel_user(payload):
-    return await api_patch_user(payload, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def patch_panel_user(payload, *, retry=True):
+    return await api_patch_user(payload, PANEL_URL, get_headers(), PANEL_VERIFY_TLS, retry=retry)
 
 
 async def delete_panel_user(user_id):
@@ -585,6 +589,52 @@ async def get_panel_config_profiles():
 
 async def get_user_accessible_nodes(user_id):
     return await api_get_user_accessible_nodes(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+def owned_subscription(tg_id, panel_user_id):
+    if isinstance(panel_user_id, bool) or not isinstance(panel_user_id, int) or panel_user_id <= 0:
+        return None
+    return db_query("SELECT * FROM subscriptions WHERE tg_id=? AND user_id=?",
+                    (int(tg_id), panel_user_id), one=True)
+
+
+async def checked_owned_panel_user(tg_id, panel_user_id):
+    if not owned_subscription(tg_id, panel_user_id):
+        return None
+    user = await get_panel_user(panel_user_id)
+    if user and user.get('telegramId') not in (None, int(tg_id)):
+        return None
+    return user
+
+
+async def get_user_devices(panel_user_id):
+    return await v38_api.get_user_hwid_devices(panel_user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def delete_user_device(panel_user_id, hwid):
+    return await v38_api.delete_user_hwid_device(panel_user_id, hwid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def delete_all_user_devices(panel_user_id):
+    return await v38_api.delete_all_user_hwid_devices(panel_user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def revoke_subscription(panel_user_id):
+    return await v38_api.revoke_user_subscription(panel_user_id, PANEL_URL, get_headers(), False, PANEL_VERIFY_TLS)
+
+
+async def extend_subscription(panel_user_id, days):
+    return await v38_api.extend_user_expiration(panel_user_id, days, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+
+
+async def poll_node_geocheck(job_id):
+    for attempt in range(6):
+        if attempt:
+            await asyncio.sleep(5)
+        result = await v38_api.get_node_geocheck_result(job_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+        if result['isCompleted'] or result['isFailed']:
+            return result
+    return None
 
 
 async def refresh_panel_capabilities():
@@ -723,6 +773,178 @@ async def send_or_edit_menu(update, context, text, reply_markup, parse_mode='Mar
     else:
         await _safe_send(update.effective_chat.id, text, reply_markup, parse_mode)
 
+
+async def send_subscription_card(context, tg_id, panel_user, panel_user_id):
+    """Build the QR only from the freshly returned Panel subscription URL."""
+    url = panel_user.get('subscriptionUrl') or ''
+    local = owned_subscription(tg_id, panel_user_id)
+    back = InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回订阅', callback_data='client_status')]])
+    if not local:
+        await context.bot.send_message(tg_id, '⚠️ 本地订阅绑定已变化，请联系管理员。', reply_markup=back)
+        return
+    summary = fit_message(f"📃 订阅详情\n状态：{panel_user.get('status', '-')}\n到期：{format_time(panel_user.get('expireAt'))}", 900)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton('💳 续费此订阅', callback_data=f"selrenew_{get_short_id(panel_user_id)}")],
+        [InlineKeyboardButton('📱 我的设备', callback_data=f"client_devices_{local['id']}"),
+         InlineKeyboardButton('🔐 重置订阅', callback_data=f"client_revoke_{local['id']}")],
+        [InlineKeyboardButton('🔙 返回列表', callback_data='client_status')],
+    ])
+    if url.startswith(('https://', 'http://')):
+        await context.bot.send_photo(tg_id, photo=generate_qr(url), caption=summary,
+                                     parse_mode=None, reply_markup=keyboard)
+        await context.bot.send_message(tg_id, fit_message(f'🔗 最新订阅链接：\n{url}', 4000), parse_mode=None)
+    else:
+        await context.bot.send_message(tg_id, summary + '\n订阅链接：暂不可用', parse_mode=None, reply_markup=keyboard)
+
+
+async def show_client_devices(update, context, local_id):
+    tg_id = update.effective_user.id
+    local = db_query('SELECT * FROM subscriptions WHERE id=? AND tg_id=? AND user_id IS NOT NULL',
+                     (local_id, tg_id), one=True)
+    if not local:
+        await send_or_edit_menu(update, context, '⚠️ 订阅绑定不存在或无权限。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='client_status')]]), parse_mode=None)
+        return
+    panel_user_id = int(local['user_id'])
+    user = await checked_owned_panel_user(tg_id, panel_user_id)
+    if not user:
+        await send_or_edit_menu(update, context, '⚠️ 面板用户绑定需要管理员核对。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='client_status')]]), parse_mode=None)
+        return
+    payload = await get_user_devices(panel_user_id)
+    rows = []
+    for i, device in enumerate(payload['devices'][:8], 1):
+        token = create_action_request(DB_FILE, tg_id, panel_user_id, 'user_delete_one', {'hwid': device['hwid']})
+        rows.append([InlineKeyboardButton(f'🗑 清除设备 #{i}', callback_data=f'client_device_confirm_{token}')])
+    if payload['devices']:
+        rows.append([InlineKeyboardButton('🗑 清除全部设备', callback_data=f'client_clear_devices_{local_id}')])
+    rows.append([InlineKeyboardButton('🔙 返回订阅', callback_data='client_status')])
+    await send_or_edit_menu(update, context, device_summary(payload, user.get('hwidDeviceLimit')),
+                            InlineKeyboardMarkup(rows), parse_mode=None)
+
+
+def _action_failure_status(exc):
+    message = str(exc)
+    return 'failed' if any(f'HTTP {code}' in message for code in (400, 401, 403, 404, 409)) else 'unknown'
+
+
+async def execute_confirmed_action(update, context, *, admin=False):
+    query = update.callback_query
+    actor = query.from_user.id
+    token = query.data.split('_', 1)[1]
+    row = get_action_request(DB_FILE, token)
+    allowed = {'admin_delete_one', 'admin_delete_all', 'admin_revoke'} if admin else {
+        'user_delete_one', 'user_delete_all', 'user_revoke'}
+    if not row or row['tg_id'] != actor or row['action'] not in allowed or (admin and actor != ADMIN_ID):
+        await query.answer('无权限或操作已过期', show_alert=True)
+        return
+    panel_user_id = int(row['user_id'])
+    if not admin and not await checked_owned_panel_user(actor, panel_user_id):
+        await query.answer('订阅绑定已变化，操作已停止', show_alert=True)
+        return
+    if not claim_action_request(DB_FILE, token, actor, row['action']):
+        await query.answer('操作已处理、正在处理或已过期，请勿重复提交', show_alert=True)
+        return
+    await query.answer()
+    try:
+        if row['action'].endswith('delete_one'):
+            hwid = json.loads(row['payload_json'])['hwid']
+            payload = await delete_user_device(panel_user_id, hwid)
+            result = f"✅ 设备已清除。当前设备数：{int(payload['total'])}。"
+        elif row['action'].endswith('delete_all'):
+            payload = await delete_all_user_devices(panel_user_id)
+            result = f"✅ 设备已清空。当前设备数：{int(payload['total'])}。"
+        else:
+            await revoke_subscription(panel_user_id)
+            result = '✅ 订阅已重置。旧凭据可能失效，请使用最新订阅信息。'
+        finish_action_request(DB_FILE, token, 'done')
+    except Exception as exc:
+        status = _action_failure_status(exc)
+        finish_action_request(DB_FILE, token, status)
+        logger.warning('V3.8 action %s for user %s ended %s (%s)', row['action'], panel_user_id,
+                       status, type(exc).__name__)
+        result = ('⚠️ 结果不确定，请联系管理员核对后再操作。' if status == 'unknown'
+                  else '❌ 面板拒绝了操作，请检查权限或用户状态。')
+        await send_or_edit_menu(update, context, result, InlineKeyboardMarkup([
+            [InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+        return
+    await send_or_edit_menu(update, context, result, InlineKeyboardMarkup([
+        [InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+    if row['action'].endswith('revoke'):
+        try:
+            refreshed = await get_panel_user(panel_user_id)
+        except PanelApiError:
+            refreshed = None
+        if not refreshed:
+            await context.bot.send_message(actor, '⚠️ 暂时无法读取新订阅链接。请稍后从“我的订阅”重新打开；不要使用旧二维码。')
+            return
+        if admin:
+            local = db_query('SELECT tg_id FROM subscriptions WHERE user_id=?', (panel_user_id,), one=True)
+            if local and refreshed.get('telegramId') in (None, int(local['tg_id'])):
+                try:
+                    await send_subscription_card(context, int(local['tg_id']), refreshed, panel_user_id)
+                except Exception as exc:
+                    logger.warning('Could not notify user after admin revoke: %s', type(exc).__name__)
+        else:
+            if await checked_owned_panel_user(actor, panel_user_id):
+                await send_subscription_card(context, actor, refreshed, panel_user_id)
+            else:
+                await context.bot.send_message(actor, '⚠️ 订阅绑定已变化，请联系管理员获取新的订阅信息。')
+
+
+async def show_admin_devices(update, context, panel_user_id):
+    user = await get_panel_user(panel_user_id)
+    if not user:
+        await send_or_edit_menu(update, context, '⚠️ 面板用户不存在。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='admin_panel_user_lookup')]]), parse_mode=None)
+        return
+    devices = await get_user_devices(panel_user_id)
+    rows = []
+    for i, device in enumerate(devices['devices'][:8], 1):
+        token = create_action_request(DB_FILE, ADMIN_ID, panel_user_id, 'admin_delete_one', {'hwid': device['hwid']})
+        rows.append([InlineKeyboardButton(f'🗑 清除设备 #{i}', callback_data=f'admin_device_confirm_{token}')])
+    rows.extend([
+        [InlineKeyboardButton('🗑 清除全部', callback_data=f'admin_clear_devices_{panel_user_id}')],
+        [InlineKeyboardButton('🔢 修改设备上限', callback_data=f'admin_limit_{panel_user_id}')],
+        [InlineKeyboardButton('🔙 返回用户', callback_data=f'manage_user_{panel_user_id}')],
+    ])
+    await send_or_edit_menu(update, context, device_summary(devices, user.get('hwidDeviceLimit'), admin=True),
+                            InlineKeyboardMarkup(rows), parse_mode=None)
+
+
+async def show_admin_dashboard(update, context):
+    if not panel_config_ready():
+        await send_or_edit_menu(update, context, '⚠️ 请先配置面板地址和 Token。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+        return
+    end = datetime.datetime.now(datetime.timezone.utc)
+    start = end - datetime.timedelta(days=7)
+    stamp = lambda value: value.isoformat(timespec='seconds').replace('+00:00', 'Z')
+    stats, recap, digest = await asyncio.gather(
+        get_panel_system_stats(), get_panel_system_stats_recap(),
+        v38_api.get_system_stats_digest(stamp(start), stamp(end), PANEL_URL, get_headers(), PANEL_VERIFY_TLS),
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('🔄 刷新', callback_data='admin_system_dashboard')],
+        [InlineKeyboardButton('🌐 节点指标', callback_data='admin_dashboard_nodes'),
+         InlineKeyboardButton('📈 HTTP 统计', callback_data='admin_dashboard_http')],
+        [InlineKeyboardButton('🔙 返回', callback_data='back_home')],
+    ])
+    await send_or_edit_menu(update, context, dashboard_summary(stats, recap, digest), kb, parse_mode=None)
+
+
+async def show_admin_geocheck_nodes(update, context):
+    nodes = await get_nodes_status()
+    rows = []
+    for node in nodes[:15]:
+        node_uuid = node.get('uuid')
+        if node_uuid:
+            rows.append([InlineKeyboardButton(str(node.get('name') or node_uuid)[:40], callback_data=f'admin_node_{node_uuid}')])
+    rows.append([InlineKeyboardButton('🔙 返回', callback_data='back_home')])
+    await send_or_edit_menu(update, context,
+                            fit_message(f'🩺 请选择 GeoCheck 节点（显示 {min(len(nodes), 15)}/{len(nodes)}）。\n需要兼容的 Remnawave Node。'),
+                            InlineKeyboardMarkup(rows), parse_mode=None)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user_id = update.effective_user.id
@@ -780,7 +1002,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🕒 操作时间线", callback_data="admin_ops_timeline"), InlineKeyboardButton("📢 群发通知", callback_data="admin_broadcast_start")],
             [InlineKeyboardButton("💳 收款设置", callback_data="admin_pay_settings"), InlineKeyboardButton("🔌 面板配置", callback_data="admin_panel_config")],
             [InlineKeyboardButton("🧩 模板中心", callback_data="admin_template_center"), InlineKeyboardButton("🗂 批量任务", callback_data="admin_bulk_jobs")],
-            [InlineKeyboardButton("🔎 面板用户检索", callback_data="admin_panel_user_lookup"), InlineKeyboardButton("🖥 系统面板", callback_data="admin_system_dashboard")]
+            [InlineKeyboardButton("🔎 面板用户检索", callback_data="admin_panel_user_lookup"), InlineKeyboardButton("📊 数据统计", callback_data="admin_system_dashboard")],
+            [InlineKeyboardButton("📱 HWID 统计", callback_data="admin_hwid_stats"), InlineKeyboardButton("🩺 Node GeoCheck", callback_data="admin_geocheck_nodes")]
         ]
     else:
         msg_text = "👋 **欢迎使用自助服务！**\n请选择操作："
@@ -798,9 +1021,52 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not check_cooldown(query.from_user.id):
         await query.answer("⏳ 操作太快了...", show_alert=False)
         return
-    await query.answer()
     data = query.data
     user_id = query.from_user.id
+    if data.startswith('v38u_'):
+        await execute_confirmed_action(update, context)
+        return
+    await query.answer()
+
+    if data.startswith('client_devices_'):
+        try:
+            await show_client_devices(update, context, int(data.removeprefix('client_devices_')))
+        except (PanelApiError, ValueError, KeyError) as exc:
+            logger.warning('GET /hwid/devices/{userId} failed: %s', type(exc).__name__)
+            await send_or_edit_menu(update, context, '⚠️ 设备信息暂不可用，请稍后重试。',
+                                    InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='client_status')]]), parse_mode=None)
+        return
+    if data.startswith('client_device_confirm_'):
+        token = data.removeprefix('client_device_confirm_')
+        row = get_action_request(DB_FILE, token)
+        if not row or row['tg_id'] != user_id or row['action'] != 'user_delete_one' or not owned_subscription(user_id, row['user_id']):
+            await query.answer('无权限或操作已过期', show_alert=True)
+            return
+        await send_or_edit_menu(update, context, '⚠️ 确认清除这台设备？该设备可能需要重新连接。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('确认清除', callback_data=f'v38u_{token}')],
+                                                      [InlineKeyboardButton('取消', callback_data='client_status')]]), parse_mode=None)
+        return
+    if data.startswith(('client_clear_devices_', 'client_revoke_')):
+        clear_all = data.startswith('client_clear_devices_')
+        prefix = 'client_clear_devices_' if clear_all else 'client_revoke_'
+        try:
+            local_id = int(data.removeprefix(prefix))
+        except ValueError:
+            await query.answer('无效订阅', show_alert=True)
+            return
+        local = db_query('SELECT * FROM subscriptions WHERE id=? AND tg_id=? AND user_id IS NOT NULL',
+                         (local_id, user_id), one=True)
+        if not local or not await checked_owned_panel_user(user_id, int(local['user_id'])):
+            await query.answer('订阅绑定不存在或无权限', show_alert=True)
+            return
+        action = 'user_delete_all' if clear_all else 'user_revoke'
+        token = create_action_request(DB_FILE, user_id, int(local['user_id']), action)
+        warning = ('⚠️ 确认清除全部设备？所有设备可能需要重新连接。' if clear_all
+                   else '⚠️ 确认重置订阅？旧订阅凭据和二维码可能立即失效。')
+        await send_or_edit_menu(update, context, warning,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('确认操作', callback_data=f'v38u_{token}')],
+                                                      [InlineKeyboardButton('取消', callback_data='client_status')]]), parse_mode=None)
+        return
 
     if data == "back_home":
         await start(update, context)
@@ -995,40 +1261,24 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif data.startswith("view_sub_"):
         short_id = data.split("_")[2]
-        target_uuid = get_panel_user_id_from_short(short_id)
-        if not target_uuid:
+        target_user_id = get_panel_user_id_from_short(short_id)
+        if not target_user_id or not owned_subscription(user_id, target_user_id):
             await query.answer("❌ 按钮已过期")
             return
         await query.answer("🔄 加载详情中...")
         try: await query.delete_message()
         except Exception as exc:
             logger.debug("delete stale sub detail message failed: %s", exc)
-        info = await get_panel_user(target_uuid)
+        info = await checked_owned_panel_user(user_id, target_user_id)
         if not info:
-            await context.bot.send_message(user_id, "⚠️ 此订阅已被删除。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回列表", callback_data="client_status")]]))
+            await context.bot.send_message(user_id, "⚠️ 订阅不存在或绑定需要管理员核对。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回列表", callback_data="client_status")]]))
             return
-        expire_show = format_time(info.get('expireAt'))
-        limit = info.get('trafficLimitBytes', 0)
-        used = info.get('userTraffic', {}).get('usedTrafficBytes', 0)
-        limit_gb = round(limit / (1024**3), 2)
-        remain_gb = round((limit - used) / (1024**3), 2)
-        sub_url = info.get('subscriptionUrl', '无链接')
-        progress = draw_progress_bar(used, limit)
-        strategy = info.get('trafficLimitStrategy', 'NO_RESET')
-        strategy_label = get_strategy_label(strategy)
-        caption = (f"📃 **订阅详情**\n\n📊 流量：`{progress}`\n🔋 剩余：`{remain_gb} GB` / `{limit_gb} GB ({strategy_label})`\n⏳ 到期：`{expire_show}`\n🔗 订阅链接：\n`{sub_url}`")
-        sid = get_short_id(target_uuid)
-        keyboard = [[InlineKeyboardButton(f"💳 续费此订阅", callback_data=f"selrenew_{sid}")], [InlineKeyboardButton("🔙 返回列表", callback_data="client_status")]]
-        if sub_url and sub_url.startswith('http'):
-            qr_bio = generate_qr(sub_url)
-            await context.bot.send_photo(chat_id=user_id, photo=qr_bio, caption=caption, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await context.bot.send_message(chat_id=user_id, text=caption, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_subscription_card(context, user_id, info, target_user_id)
 
     elif data.startswith("selrenew_"):
         short_id = data.split("_")[1]
         target_uuid = get_panel_user_id_from_short(short_id)
-        if not target_uuid:
+        if not target_uuid or not owned_subscription(user_id, target_uuid):
             await query.answer("❌ 信息过期")
             return
         
@@ -1220,6 +1470,10 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
     if order_type == 'renew' and not target_user_id:
         await send_or_edit_menu(update, context, "⚠️ 旧订阅尚未完成迁移，暂不能续费。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="client_status")]]))
         return
+    if order_type == 'renew' and not owned_subscription(user_id, target_user_id):
+        await send_or_edit_menu(update, context, "⚠️ 此订阅不属于当前用户，无法创建续费订单。",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="client_status")]]))
+        return
     if order_type == 'new' and db_query(
         "SELECT 1 FROM subscriptions WHERE tg_id=? AND user_id IS NULL LIMIT 1", (user_id,), one=True
     ):
@@ -1392,8 +1646,13 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.from_user.id != ADMIN_ID:
         await query.answer("无管理员权限", show_alert=True)
         return
+    if query.data.startswith('v38a_'):
+        await execute_confirmed_action(update, context, admin=True)
+        return
     await query.answer()
     data = query.data
+    if not data.startswith('admin_limit_'):
+        context.user_data.pop('hwid_limit_user', None)
 
     # 只要离开“回复输入模式”，就清理回复上下文，避免串场
     if not data.startswith("reply_user_"):
@@ -1405,6 +1664,154 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if data == "back_home":
         await start(update, context)
+        return
+
+    if data.startswith('admin_devices_'):
+        try:
+            await show_admin_devices(update, context, int(data.removeprefix('admin_devices_')))
+        except (PanelApiError, ValueError, KeyError) as exc:
+            logger.warning('admin GET /hwid/devices/{userId} failed: %s', type(exc).__name__)
+            await send_or_edit_menu(update, context, '⚠️ 设备信息暂不可用。',
+                                    InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='admin_panel_user_lookup')]]), parse_mode=None)
+        return
+    if data.startswith('admin_device_confirm_'):
+        token = data.removeprefix('admin_device_confirm_')
+        row = get_action_request(DB_FILE, token)
+        if not row or row['tg_id'] != ADMIN_ID or row['action'] != 'admin_delete_one':
+            await send_or_edit_menu(update, context, '⚠️ 操作已过期。',
+                                    InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+            return
+        await send_or_edit_menu(update, context, '⚠️ 确认清除该用户的这台设备？',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('确认清除', callback_data=f'v38a_{token}')],
+                                                      [InlineKeyboardButton('取消', callback_data=f"admin_devices_{row['user_id']}")]]), parse_mode=None)
+        return
+    if data.startswith(('admin_clear_devices_', 'admin_revoke_')):
+        clear_all = data.startswith('admin_clear_devices_')
+        prefix = 'admin_clear_devices_' if clear_all else 'admin_revoke_'
+        try:
+            panel_user_id = int(data.removeprefix(prefix))
+            if not await get_panel_user(panel_user_id):
+                raise ValueError('missing user')
+        except (ValueError, PanelApiError):
+            await send_or_edit_menu(update, context, '⚠️ 面板用户不存在或暂不可用。',
+                                    InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+            return
+        token = create_action_request(DB_FILE, ADMIN_ID, panel_user_id,
+                                      'admin_delete_all' if clear_all else 'admin_revoke')
+        warning = ('⚠️ 确认清除该用户全部设备？' if clear_all else
+                   '⚠️ 确认完整重置该用户订阅？旧凭据和二维码可能失效。')
+        await send_or_edit_menu(update, context, warning,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('确认操作', callback_data=f'v38a_{token}')],
+                                                      [InlineKeyboardButton('取消', callback_data=f'admin_devices_{panel_user_id}')]]), parse_mode=None)
+        return
+    if data.startswith('admin_limit_'):
+        try:
+            panel_user_id = int(data.removeprefix('admin_limit_'))
+        except ValueError:
+            return
+        context.user_data['hwid_limit_user'] = panel_user_id
+        await send_or_edit_menu(update, context, '请输入设备上限（0 或正整数；输入 null 清除限制）。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('取消', callback_data=f'admin_devices_{panel_user_id}')]]), parse_mode=None)
+        return
+    if data == 'admin_hwid_stats':
+        try:
+            payload = await v38_api.get_hwid_devices_stats(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+            stats = payload['stats']
+            body = (f"📱 HWID 统计\n总设备：{stats['totalHwidDevices']}\n唯一设备：{stats['totalUniqueDevices']}\n"
+                    f"人均设备：{stats['averageHwidDevicesPerUser']}")
+        except (PanelApiError, KeyError, TypeError) as exc:
+            logger.warning('GET /hwid/devices/stats failed: %s', type(exc).__name__)
+            body = '⚠️ HWID 统计暂不可用。'
+        await send_or_edit_menu(update, context, body,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('👥 Top Users', callback_data='admin_hwid_top')],
+                                                      [InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+        return
+    if data == 'admin_hwid_top':
+        try:
+            payload = await v38_api.get_top_users_by_hwid_devices(PANEL_URL, get_headers(), size=10,
+                                                                    verify_tls=PANEL_VERIFY_TLS)
+            body = top_hwid_users_summary(payload)
+        except (PanelApiError, ValueError) as exc:
+            logger.warning('GET /hwid/devices/top-users failed: %s', type(exc).__name__)
+            body = '⚠️ Top Users 暂不可用。'
+        await send_or_edit_menu(update, context, body,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='admin_hwid_stats')]]), parse_mode=None)
+        return
+    if data == 'admin_panel_user_tags':
+        try:
+            tags = await v38_api.get_panel_user_tags(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+            body = fit_message('🏷 面板用户标签\n' + ('\n'.join(str(tag)[:16] for tag in tags[:50]) if tags else '暂无标签'))
+        except PanelApiError as exc:
+            logger.warning('GET /users/tags failed: %s', type(exc).__name__)
+            body = '⚠️ 标签暂不可用。'
+        await send_or_edit_menu(update, context, body,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='admin_panel_user_lookup')]]), parse_mode=None)
+        return
+    if data == 'admin_geocheck_nodes':
+        try:
+            await show_admin_geocheck_nodes(update, context)
+        except PanelApiError as exc:
+            logger.warning('GET /nodes for GeoCheck failed: %s', type(exc).__name__)
+            await send_or_edit_menu(update, context, '⚠️ 节点列表暂不可用。',
+                                    InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
+        return
+    if data.startswith('admin_node_'):
+        node_uuid = data.removeprefix('admin_node_')
+        try:
+            nodes = await get_nodes_status()
+            node = next((item for item in nodes if item.get('uuid') == node_uuid), None)
+            if not node:
+                raise ValueError('node not found')
+            body = fit_message('\n'.join([
+                '🌐 节点详情', f"名称：{str(node['name'])[:80]}",
+                f"UUID：{node_uuid}",
+                f"状态：{'在线' if node['isConnected'] else '离线'}",
+                f"已禁用：{'是' if node['isDisabled'] else '否'}",
+                f"最近状态：{str(node.get('lastStatusMessage') or '-')[:180]}",
+            ]))
+        except (PanelApiError, ValueError, KeyError) as exc:
+            logger.warning('node detail failed: %s', type(exc).__name__)
+            body = '⚠️ 节点详情暂不可用。'
+        await send_or_edit_menu(update, context, body, InlineKeyboardMarkup([
+            [InlineKeyboardButton('🩺 GeoCheck', callback_data=f'admin_geo_{node_uuid}')],
+            [InlineKeyboardButton('🔙 返回节点', callback_data='admin_geocheck_nodes')],
+        ]), parse_mode=None)
+        return
+    if data.startswith('admin_geo_'):
+        node_uuid = data.removeprefix('admin_geo_')
+        await send_or_edit_menu(update, context, '🩺 正在检测节点，请稍候…',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='admin_geocheck_nodes')]]), parse_mode=None)
+        try:
+            job_id = await v38_api.start_node_geocheck(node_uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+            result = await asyncio.wait_for(poll_node_geocheck(job_id), timeout=75)
+            body = geocheck_summary(result) if result else '🩺 GeoCheck 尚未完成，请稍后重新检测。'
+        except (PanelApiError, ValueError, asyncio.TimeoutError) as exc:
+            logger.warning('GeoCheck node operation failed: %s', type(exc).__name__)
+            body = ('当前节点可能不支持 GeoCheck，请检查 Remnawave Node 版本。'
+                    if 'HTTP 400' in str(exc) or 'HTTP 404' in str(exc) or 'HTTP 409' in str(exc)
+                    else '⚠️ GeoCheck 尚未完成或暂不可用，请稍后重试。')
+        await send_or_edit_menu(update, context, body,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回节点', callback_data=f'admin_node_{node_uuid}')]]), parse_mode=None)
+        return
+    if data == 'admin_dashboard_nodes':
+        try:
+            payload = await v38_api.get_system_nodes_metrics(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+            body = node_metrics_summary(payload)
+        except PanelApiError as exc:
+            logger.warning('GET /system/nodes/metrics failed: %s', type(exc).__name__)
+            body = '⚠️ 节点指标暂不可用。'
+        await send_or_edit_menu(update, context, body,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回统计', callback_data='admin_system_dashboard')]]), parse_mode=None)
+        return
+    if data == 'admin_dashboard_http':
+        try:
+            payload = await v38_api.get_system_http_stats(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+            body = http_stats_summary(payload)
+        except PanelApiError as exc:
+            logger.warning('GET /system/stats/http failed: %s', type(exc).__name__)
+            body = '⚠️ HTTP 统计暂不可用。'
+        await send_or_edit_menu(update, context, body,
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回统计', callback_data='admin_system_dashboard')]]), parse_mode=None)
         return
 
     if data.startswith("reply_user_"):
@@ -1535,10 +1942,12 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "- `tg:123456789`（按 Telegram ID）\n"
             "- `username:alice`（按用户名）\n"
             "- `id:123`（面板数值用户 ID）\n"
-            "- `short:abcd1234`（短 UUID）\n"
+            "- `short:短UUID`（短 UUID）\n"
+            "纯数字按面板用户 ID；Telegram ID 请明确使用 tg:。\n"
             "- `bind:TG_ID:PANEL_ID:本地订阅记录ID`（多条旧记录时精确绑定）。"
         )
-        kb = [[InlineKeyboardButton("🔙 取消", callback_data="back_home")]]
+        kb = [[InlineKeyboardButton("🏷 查看 Panel Tags", callback_data="admin_panel_user_tags")],
+              [InlineKeyboardButton("🔙 取消", callback_data="back_home")]]
         await send_or_edit_menu(update, context, tip, InlineKeyboardMarkup(kb))
         return
     if data.startswith("bind_panel_user_"):
@@ -1575,29 +1984,13 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
     if data == "admin_system_dashboard":
-        health = await get_panel_system_health()
-        stats = await get_panel_system_stats()
-        recap = await get_panel_system_stats_recap()
-        lines = ["🖥 **系统面板（基础）**"]
-        if health:
-            lines.append(f"健康信息字段: `{len(health.keys())}` 项")
-            for k in list(health.keys())[:6]:
-                lines.append(f"- {k}: {str(health.get(k))[:60]}")
-        else:
-            lines.append("- ⚠️ 系统健康信息不可用（可能是配置/权限/连通性问题）")
-        if stats:
-            lines.append(f"\n统计字段: `{len(stats.keys())}` 项")
-            for k in list(stats.keys())[:8]:
-                lines.append(f"- {k}: {str(stats.get(k))[:60]}")
-        else:
-            lines.append("\n- ⚠️ /system/stats 不可用")
-        if recap:
-            lines.append(f"\nRecap字段: `{len(recap.keys())}` 项")
-            for k in list(recap.keys())[:6]:
-                lines.append(f"- {k}: {str(recap.get(k))[:60]}")
-        else:
-            lines.append("- ⚠️ /system/stats/recap 不可用")
-        await send_or_edit_menu(update, context, "\n".join(lines), InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+        try:
+            await show_admin_dashboard(update, context)
+        except (PanelApiError, ValueError, TypeError) as exc:
+            logger.warning('GET /system/stats dashboard failed: %s', type(exc).__name__)
+            await send_or_edit_menu(update, context, '⚠️ 统计暂不可用，请检查面板连接与权限。',
+                                    InlineKeyboardMarkup([[InlineKeyboardButton('🔄 重试', callback_data='admin_system_dashboard')],
+                                                          [InlineKeyboardButton('🔙 返回', callback_data='back_home')]]), parse_mode=None)
         return
     if data == "admin_bulk_jobs":
         rows = db_query("SELECT * FROM bulk_jobs ORDER BY created_at DESC LIMIT 20")
@@ -1954,21 +2347,31 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 - 批量禁用
 - 批量删除
 - 批量改到期日
-- 批量改流量包"""
+- 批量改流量包
+- 批量续期 / 批量撤销订阅"""
         kb = [
             [InlineKeyboardButton("🔄 批量重置流量", callback_data="bulk_reset")],
             [InlineKeyboardButton("⛔ 批量禁用", callback_data="bulk_disable")],
             [InlineKeyboardButton("🗑 批量删除", callback_data="bulk_delete")],
             [InlineKeyboardButton("📅 批量改到期日", callback_data="bulk_expire")],
             [InlineKeyboardButton("📡 批量改流量包", callback_data="bulk_traffic")],
+            [InlineKeyboardButton("⏳ 批量续期", callback_data="bulk_extend")],
+            [InlineKeyboardButton("🔐 批量撤销订阅", callback_data="bulk_revoke")],
             [InlineKeyboardButton("🔙 返回", callback_data="back_home")],
         ]
         await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(kb))
         return
-    if data in {"bulk_reset", "bulk_disable", "bulk_delete"}:
+    if data in {"bulk_reset", "bulk_disable", "bulk_delete", "bulk_revoke"}:
+        context.user_data.pop('bulk_pending', None)
         context.user_data['bulk_action'] = data.replace('bulk_', '')
         tip = "每行一个面板数值用户 ID，或使用空格/逗号分隔。"
         await send_or_edit_menu(update, context, f"✍️ 请输入面板用户 ID 列表\n{tip}", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_bulk_menu")]]))
+        return
+    if data == 'bulk_extend':
+        context.user_data.pop('bulk_pending', None)
+        context.user_data['bulk_action'] = 'extend'
+        await send_or_edit_menu(update, context, '✍️ 第一行输入续期天数（1–9999），后续输入选定的面板数值用户 ID。',
+                                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 取消', callback_data='admin_bulk_menu')]]), parse_mode=None)
         return
     if data == "bulk_expire":
         context.user_data['bulk_action'] = 'expire'
@@ -2094,8 +2497,11 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 node_lines.append(f"- {node_name}")
         else:
             node_lines.append("- 暂无可访问节点")
-        msg = (f"👤 **用户详情**\nTG ID: `{dict(sub)['tg_id']}`\n状态: {status}\n面板用户ID: `{target_user_id}`\n\n" + "\n".join(node_lines))
+        tag = (panel_info or {}).get('tag') or '-'
+        msg = (f"👤 **用户详情**\nTG ID: `{dict(sub)['tg_id']}`\n状态: {status}\n面板用户ID: `{target_user_id}`\nPanel tag: `{tag}`\n\n" + "\n".join(node_lines))
         keyboard = [
+            [InlineKeyboardButton("📱 设备管理", callback_data=f"admin_devices_{target_user_id}")],
+            [InlineKeyboardButton("🔐 重置订阅", callback_data=f"admin_revoke_{target_user_id}")],
             [InlineKeyboardButton("🔄 重置流量", callback_data=f"reset_traffic_{target_user_id}")],
             [InlineKeyboardButton("📜 最近请求记录", callback_data=f"user_reqhist_{target_user_id}")],
             [InlineKeyboardButton("🗑 确认删除用户", callback_data=f"confirm_del_user_{target_user_id}")],
@@ -2229,6 +2635,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]])
 
+    if user_id == ADMIN_ID and context.user_data.get('hwid_limit_user') is not None and text:
+        panel_user_id = int(context.user_data['hwid_limit_user'])
+        value = text.strip().lower()
+        if value == 'null':
+            limit = None
+        elif value.isdigit() and int(value) <= 9007199254740991:
+            limit = int(value)
+        else:
+            await update.message.reply_text('❌ 请输入 0 或正整数；输入 null 清除限制。')
+            return
+        try:
+            response = await patch_panel_user({'id': panel_user_id, 'hwidDeviceLimit': limit})
+            if response.status_code != 200:
+                raise PanelApiError(f'Panel returned HTTP {response.status_code}')
+        except PanelApiError as exc:
+            logger.warning('PATCH /users HWID limit failed: %s', type(exc).__name__)
+            await update.message.reply_text('⚠️ 修改失败，请检查面板权限与用户状态。')
+            return
+        context.user_data.pop('hwid_limit_user', None)
+        await update.message.reply_text(f'✅ 设备上限已更新：{limit if limit is not None else "无限制"}',
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回设备', callback_data=f'admin_devices_{panel_user_id}')]]))
+        return
+
     if user_id == ADMIN_ID and context.user_data.get('set_payimg'):
         pay_type = context.user_data.get('set_payimg')
         file_id = None
@@ -2310,31 +2739,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ 已绑定本地记录 #{local_id} 到面板用户 ID {panel_id}。")
             return
         panel_user = None
-        if lookup_type in {"tg", "telegram", "telegram_id", "auto"} and lookup_value.isdigit():
-            try:
+        try:
+            if lookup_type in {"tg", "telegram", "telegram_id"}:
+                if not lookup_value.isdigit():
+                    raise ValueError('Telegram ID must be numeric')
                 panel_user = await get_user_by_telegram_id(int(lookup_value))
-            except AmbiguousPanelUserError:
-                await update.message.reply_text("⚠️ 该 Telegram ID 对应多个面板用户。请使用 id:数值ID 精确检索。")
-                return
-            except PanelApiError:
-                await update.message.reply_text("⚠️ 面板查询失败，请检查连通性与权限后重试。")
-                return
-            lookup_type = "telegramId"
-        elif lookup_type in {"username", "user"}:
-            panel_user = await get_user_by_username(lookup_value)
-            lookup_type = "username"
-        elif lookup_type in {"id", "user_id"} and lookup_value.isdigit():
-            panel_user = await get_panel_user(int(lookup_value))
-            lookup_type = "userId"
-        elif lookup_type in {"short", "short_uuid"}:
-            panel_user = await get_user_by_short_uuid(lookup_value)
-            lookup_type = "shortUuid"
-        elif lookup_value.isdigit():
-            panel_user = await get_user_by_telegram_id(int(lookup_value))
-            lookup_type = "telegramId"
-        else:
-            panel_user = await get_user_by_username(lookup_value)
-            lookup_type = "username"
+                lookup_type = "telegramId"
+            else:
+                if lookup_type in {"id", "user_id"} or (lookup_type == 'auto' and lookup_value.isdigit()):
+                    field, value = 'id', int(lookup_value)
+                elif lookup_type in {"short", "short_uuid"} or (
+                    lookup_type == 'auto' and len(lookup_value) == 16 and lookup_value.isalnum()
+                ):
+                    field, value = 'shortUuid', lookup_value
+                elif lookup_type in {"username", "user", "auto"}:
+                    field, value = 'username', lookup_value
+                else:
+                    raise ValueError('Unsupported lookup prefix')
+                resolved = await v38_api.resolve_panel_user(field, value, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+                panel_user = await get_panel_user(resolved['id']) if resolved else None
+                lookup_type = field
+        except AmbiguousPanelUserError:
+            await update.message.reply_text("⚠️ 该 Telegram ID 对应多个面板用户。请使用 id:数值ID 精确检索。")
+            return
+        except (PanelApiError, ValueError, KeyError) as exc:
+            logger.warning('Panel identity lookup failed: %s', type(exc).__name__)
+            await update.message.reply_text("⚠️ 面板检索失败，请检查输入、连通性和权限。")
+            return
 
         if not isinstance(panel_user, dict):
             await update.message.reply_text(
@@ -2356,8 +2787,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Telegram ID: {ptg if ptg is not None else '-'}",
             f"状态: {pstatus}",
             f"重置策略: {pstrategy}",
+            f"Panel tag: {panel_user.get('tag') or '-'}",
         ]
-        kb = [[InlineKeyboardButton("🔎 继续检索", callback_data="admin_panel_user_lookup")], [InlineKeyboardButton("🏠 返回主页", callback_data="back_home")]]
+        kb = [[InlineKeyboardButton("📱 设备管理", callback_data=f"admin_devices_{panel_id}")],
+              [InlineKeyboardButton("🔐 重置订阅", callback_data=f"admin_revoke_{panel_id}")],
+              [InlineKeyboardButton("🔎 继续检索", callback_data="admin_panel_user_lookup")],
+              [InlineKeyboardButton("🏠 返回主页", callback_data="back_home")]]
         if isinstance(panel_id, int) and isinstance(ptg, int):
             kb.insert(0, [InlineKeyboardButton("🔗 绑定到本地订阅", callback_data=f"bind_panel_user_{ptg}_{panel_id}")])
         await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
@@ -2591,10 +3026,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            if action in {'reset', 'disable', 'delete'}:
-                user_ids = parse_user_ids(text)
+            if action in {'reset', 'disable', 'delete', 'revoke'}:
+                user_ids = parse_user_ids_strict(text) if action == 'revoke' else parse_user_ids(text)
                 extra = None
-                preview = {'reset': '批量重置流量', 'disable': '批量禁用', 'delete': '批量删除'}[action]
+                preview = {'reset': '批量重置流量', 'disable': '批量禁用', 'delete': '批量删除',
+                           'revoke': '批量撤销订阅（旧凭据可能失效）'}[action]
+            elif action == 'extend':
+                days, user_ids = parse_extend_days_and_user_ids(text)
+                extra = {'days': days}
+                preview = f'批量续期 +{days} 天'
             elif action == 'expire':
                 expire_at, user_ids = parse_expire_days_and_user_ids(text)
                 extra = {'expireAt': expire_at}
@@ -2731,6 +3171,9 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order:
             await query.edit_message_text("⚠️ 订单不存在", reply_markup=admin_return_btn)
             return
+        if order['status'] != STATUS_PENDING:
+            await query.edit_message_text("⚠️ 订单已进入处理或终态，不能再拒绝；请先核对状态。", reply_markup=admin_return_btn)
+            return
         uid = int(order['tg_id'])
         retry_markup = admin_return_btn
         if len(parts) >= 5:
@@ -2738,7 +3181,7 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🧾 再次审核", callback_data=f"review_{parts[1]}_{parts[2]}_{parts[3]}_{parts[4]}")],
                 [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]
             ])
-        update_order_status(db_execute, order_id, [STATUS_PENDING, STATUS_APPROVED], STATUS_REJECTED, error_message='rejected_by_admin')
+        update_order_status(db_execute, order_id, [STATUS_PENDING], STATUS_REJECTED, error_message='rejected_by_admin')
         append_order_audit_log(db_execute, order_id, 'reject', query.from_user.id, 'admin_rejected')
         await query.edit_message_text("❌ 已拒绝", reply_markup=retry_markup)
         await clean_user_waiting_msg(order)
@@ -2757,7 +3200,7 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if order.get('status') != STATUS_FAILED:
             await query.edit_message_text("⚠️ 仅允许重试失败订单", reply_markup=admin_return_btn)
             return
-        switched = update_order_status(db_execute, order_id, [STATUS_FAILED], STATUS_APPROVED, error_message='retry_by_admin')
+        switched = update_order_status(db_execute, order_id, [STATUS_FAILED], STATUS_PENDING, error_message='retry_by_admin')
         append_order_audit_log(db_execute, order_id, 'retry', query.from_user.id, 'retry_by_admin')
         if not switched:
             await query.edit_message_text("⚠️ 订单状态更新失败，请重试", reply_markup=admin_return_btn)
@@ -2780,12 +3223,12 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("ℹ️ 该订单已发货（幂等保护）", reply_markup=admin_return_btn)
         return
 
-    if order.get('status') not in [STATUS_PENDING, STATUS_APPROVED]:
+    if order.get('status') != STATUS_PENDING:
         await query.edit_message_text(f"⚠️ 当前订单状态不可处理: {order.get('status')}", reply_markup=admin_return_btn)
         return
 
     claimed = update_order_status(db_execute, order_id, [STATUS_PENDING], STATUS_APPROVED)
-    if not claimed and order.get('status') != STATUS_APPROVED:
+    if not claimed:
         await query.edit_message_text("⚠️ 订单正在被其他操作处理，请稍后重试", reply_markup=admin_return_btn)
         return
 
@@ -2818,63 +3261,57 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_strategy = plan_dict.get('reset_strategy', 'NO_RESET')
     strategy_label = get_strategy_label(reset_strategy)
 
+    extension_started = False
     try:
         if order_type == 'renew':
             if not target_user_id:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:business_validation|missing_target_uuid')
                 await query.edit_message_text("⚠️ 订单数据已过期", reply_markup=admin_return_btn)
                 return
+            if not owned_subscription(uid, int(target_user_id)):
+                raise ValueError('续费目标已不属于该 Telegram 用户')
             user_info = await get_panel_user(target_user_id)
             if not user_info:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='user_not_found')
                 await query.edit_message_text("⚠️ 用户不存在", reply_markup=admin_return_btn)
                 return
-            try:
-                current_expire = datetime.datetime.fromisoformat(
-                    user_info['expireAt'].replace('Z', '+00:00')
-                )
-            except (KeyError, AttributeError, ValueError) as exc:
-                raise PanelContractError("Panel user has invalid expireAt") from exc
-            now = datetime.datetime.now(datetime.timezone.utc)
-            new_expire = (current_expire + datetime.timedelta(days=add_days)) if current_expire > now else (now + datetime.timedelta(days=add_days))
-            expire_iso = new_expire.strftime("%Y-%m-%dT%H:%M:%SZ")
-            new_limit = user_info['trafficLimitBytes']
+            if user_info.get('telegramId') not in (None, int(uid)):
+                raise ValueError('Panel 用户绑定与续费订单不一致')
+            if not isinstance(add_days, int) or add_days < 1:
+                raise ValueError('套餐续期天数必须为正整数')
+            # Once submitted, a lost response may still mean Panel applied Extend.
+            # The approved order is never replayed automatically or by retry UI.
+            extension_started = True
+            extended_user = await extend_subscription(target_user_id, add_days)
+            if not update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_EXTENSION_APPLIED,
+                                       delivered_user_id=target_user_id):
+                raise RuntimeError('Could not persist extension_applied for approved order')
+            new_limit = extended_user['trafficLimitBytes']
             if reset_strategy == 'NO_RESET':
                 new_limit += add_traffic
             update_payload = {
                 "id": target_user_id,
                 "trafficLimitBytes": new_limit,
-                "expireAt": expire_iso,
-                "status": USER_STATUS_ACTIVE,
-                "telegramId": int(uid),
                 "trafficLimitStrategy": reset_strategy,
             }
-            if TARGET_GROUP_UUID:
-                update_payload["activeInternalSquads"] = [TARGET_GROUP_UUID]
-            r = await patch_panel_user(update_payload)
+            r = await patch_panel_user(update_payload, retry=False)
             if r.status_code == 200:
-                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_user_id=target_user_id)
+                refreshed = await get_panel_user(target_user_id)
+                if not refreshed:
+                    raise PanelContractError('Panel user disappeared after renewal')
+                if not update_order_status(db_execute, order_id, [STATUS_EXTENSION_APPLIED], STATUS_DELIVERED,
+                                           delivered_user_id=target_user_id):
+                    raise RuntimeError('Could not persist delivered renewal state')
                 append_order_audit_log(db_execute, order_id, 'deliver_success', query.from_user.id, 'renew')
-                await sync_user_metadata(target_user_id, uid, plan_key=plan_key, order_id=order_id)
+                try:
+                    await sync_user_metadata(target_user_id, uid, plan_key=plan_key, order_id=order_id)
+                except Exception as exc:
+                    logger.warning('renewal metadata sync failed for order %s: %s', order_id, type(exc).__name__)
                 await query.edit_message_text(f"✅ 续费成功\n用户: {uid}", reply_markup=admin_return_btn)
-                sub_url = user_info['subscriptionUrl']
-                display_expire = format_time(expire_iso)
-                display_traffic = round(new_limit / 1024**3, 2)
-                msg = (
-                    f"🎉 *续费成功\\!*\n\n"
-                    f"⏳ 新到期时间: `{escape_markdown_v2(display_expire)}`\n"
-                    f"📡 当前总流量: `{escape_markdown_v2(str(display_traffic))} GB \\({escape_markdown_v2(strategy_label)}\\)`\n\n"
-                    f"🔗 订阅链接:\n`{escape_markdown_v2(sub_url)}`"
-                )
                 await clean_user_waiting_msg(order)
-                if sub_url and sub_url.startswith('http'):
-                    qr = generate_qr(sub_url)
-                    await context.bot.send_photo(uid, photo=qr, caption=msg, parse_mode='MarkdownV2', reply_markup=client_return_btn)
-                else:
-                    await context.bot.send_message(uid, msg, parse_mode='MarkdownV2', reply_markup=client_return_btn)
+                await send_subscription_card(context, uid, refreshed, target_user_id)
             else:
-                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:network|panel_api_error_renew')
-                await query.edit_message_text("❌ API报错", reply_markup=admin_return_btn)
+                raise PanelApiError(f'Panel returned HTTP {r.status_code} after Extend')
         else:
             new_expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=add_days)
             expire_iso = new_expire.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2929,9 +3366,15 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Order processing failed for %s", order_id)
         reason = classify_order_failure(str(exc))
         detail = f"reason:{reason}|{str(exc)[:320]}"
-        update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message=detail)
+        if order_type == 'renew' and extension_started:
+            update_order_status(db_execute, order_id, [STATUS_APPROVED, STATUS_EXTENSION_APPLIED],
+                                STATUS_UNKNOWN, error_message=detail)
+        else:
+            update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message=detail)
         append_order_audit_log(db_execute, order_id, 'deliver_failed', query.from_user.id, detail)
-        await query.edit_message_text(f"❌ 错误: {exc}", reply_markup=admin_return_btn)
+        await query.edit_message_text(
+            '⚠️ 续期结果不确定，请人工核对面板，禁止重复审核。' if order_type == 'renew' and extension_started
+            else '❌ 订单处理失败，请查看服务日志。', reply_markup=admin_return_btn)
 
 async def process_bulk_jobs_job(context: ContextTypes.DEFAULT_TYPE):
     rows = db_query(
@@ -2972,7 +3415,7 @@ async def process_bulk_jobs_job(context: ContextTypes.DEFAULT_TYPE):
             job['action'], user_ids, payload.get('extra') or {}, PANEL_URL, get_headers(), PANEL_VERIFY_TLS
         )
     except PanelApiError as exc:
-        if job['action'] in {'reset', 'delete'}:
+        if job['action'] in {'reset', 'delete', 'extend', 'revoke'}:
             status = 'unknown'
         else:
             status = 'retry' if attempts < 3 else 'failed'
@@ -2991,7 +3434,7 @@ async def process_bulk_jobs_job(context: ContextTypes.DEFAULT_TYPE):
         return
     result = {'accepted': accepted, 'failed': failed}
     status = 'submitted' if failed == 0 else (
-        'unknown' if job['action'] in {'reset', 'delete'} else 'failed'
+        'unknown' if job['action'] in {'reset', 'delete', 'extend', 'revoke'} else 'failed'
     )
     db_execute("UPDATE bulk_jobs SET status=?, result_json=?, updated_at=? WHERE id=?",
                (status, json.dumps(result), int(time.time()), job['id']))
@@ -3234,6 +3677,7 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^admin_"))
+    app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^v38a_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^del_plan_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^plan_detail_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^cancel_op$"))
@@ -3258,6 +3702,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^tpl_"))
     app.add_handler(CallbackQueryHandler(add_plan_start, pattern="^add_plan_start$"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^client_"))
+    app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^v38u_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^selrenew_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^order_"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^manualreview_"))

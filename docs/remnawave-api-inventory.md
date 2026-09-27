@@ -41,6 +41,22 @@ operations. Contract behavior is checked in `tests/test_panel_api_v3_contract.py
 | get_external_squads | GET | `/api/external-squads` | — | — | — | 200 GetExternalSquadsResponseDto | VERIFIED 3.4.4 | test_panel_api_v3_contract.py |
 | get_config_profiles | GET | `/api/config-profiles` | — | — | — | 200 GetConfigProfilesResponseDto | VERIFIED 3.4.4 | test_panel_api_v3_contract.py |
 | get_user_accessible_nodes | GET | `/api/users/{userId}/accessible-nodes` | userId (number) | — | — | 200 GetUserAccessibleNodesResponseDto | VERIFIED 3.4.4 | test_panel_api_v3_contract.py |
+| get_user_hwid_devices | GET | `/api/hwid/devices/{userId}` | userId (number) | — | — | 200 GetUserHwidDevicesResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| delete_user_hwid_device | POST | `/api/hwid/devices/delete` | — | — | DeleteUserHwidDeviceBodyDto | 200 DeleteUserHwidDeviceResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| delete_all_user_hwid_devices | POST | `/api/hwid/devices/delete-all` | — | — | DeleteAllUserHwidDevicesBodyDto | 200 DeleteAllUserHwidDevicesResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_hwid_devices_stats | GET | `/api/hwid/devices/stats` | — | — | 200 GetHwidDevicesStatsResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_top_users_by_hwid_devices | GET | `/api/hwid/devices/top-users` | — | start, size | — | 200 GetTopUsersByHwidDevicesResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| revoke_user_subscription | POST | `/api/users/{userId}/actions/revoke` | userId (number) | — | RevokeUserSubscriptionBodyDto | 200 UserResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| extend_user_expiration | POST | `/api/users/{userId}/actions/extend` | userId (number) | — | ExtendUserBodyDto | 200 UserResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| bulk_extend_expiration | POST | `/api/users/bulk/extend-expiration-date` | — | — | BulkExtendExpirationDateBodyDto | 204 empty | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| bulk_revoke_subscriptions | POST | `/api/users/bulk/revoke-subscription` | — | — | BulkRevokeUsersSubscriptionBodyDto | 202 empty | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| start_node_geocheck | POST | `/api/connections/geocheck/{nodeUuid}` | nodeUuid (string) | — | GeocheckByNodeBodyDto | 201 GeocheckByNodeResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_node_geocheck_result | GET | `/api/connections/geocheck/{jobId}` | jobId (string) | — | — | 200 GeocheckByNodeResultResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_system_stats_digest | GET | `/api/system/stats/digest` | — | start, end | — | 200 GetStatsDigestResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_system_http_stats | GET | `/api/system/stats/http` | — | — | — | 200 GetHttpStatsResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_system_nodes_metrics | GET | `/api/system/nodes/metrics` | — | — | — | 200 GetNodesMetricsResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| resolve_panel_user | POST | `/api/users/resolve` | — | — | ResolveUserBodyDto | 200 ResolveUserResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
+| get_panel_user_tags | GET | `/api/users/tags` | — | — | — | 200 GetUsersTagsResponseDto | VERIFIED 3.4.4 | test_panel_api_v38_contract.py |
 
 The obsolete `GET /api/bandwidth-stats/nodes/realtime` has no replacement with
 identical realtime semantics. The dashboard now displays the official

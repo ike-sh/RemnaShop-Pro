@@ -6,6 +6,8 @@ STATUS_CN = {
     'rejected': '已拒绝',
     'delivered': '已发货',
     'failed': '失败',
+    'unknown': '结果待人工核对',
+    'extension_applied': '续期已提交（后续处理待确认）',
 }
 
 TYPE_CN = {

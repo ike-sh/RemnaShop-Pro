@@ -369,7 +369,7 @@ class TestPanelApiV3Contract(unittest.IsolatedAsyncioTestCase):
                         inventory,
                     )
         self.assertEqual(unknown, [])
-        self.assertEqual(verified_count, 33)
+        self.assertEqual(verified_count, 49)
         source = Path("services/panel_api.py").read_text(encoding="utf-8")
         self.assertNotIn('"uuids"', source)
         self.assertNotIn("'/ip-control", source)

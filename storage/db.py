@@ -1,4 +1,7 @@
+import json
+import secrets
 import sqlite3
+import time
 from typing import Any, Iterable
 
 
@@ -124,9 +127,25 @@ def _init_db_on_connection(conn: sqlite3.Connection) -> None:
     # A lost response can mean a destructive request was already accepted.
     # Never replay reset/delete automatically after a crash or timeout.
     c.execute("""UPDATE bulk_jobs SET status='unknown'
-                 WHERE status IN ('running','retry') AND action IN ('reset','delete')""")
+                 WHERE status IN ('running','retry') AND action IN ('reset','delete','extend','revoke')""")
     c.execute("""UPDATE bulk_jobs SET status='pending'
-                 WHERE status='running' AND action NOT IN ('reset','delete')""")
+                 WHERE status='running' AND action NOT IN ('reset','delete','extend','revoke')""")
+
+    # A resumed approval or destructive callback may already have reached Panel.
+    # Preserve the record for manual review instead of replaying the write.
+    c.execute("UPDATE orders SET status='unknown' WHERE order_type='renew' AND status IN ('approved','extension_applied')")
+    c.execute('''CREATE TABLE IF NOT EXISTS action_requests (
+        id TEXT PRIMARY KEY,
+        tg_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )''')
+    c.execute("UPDATE action_requests SET status='unknown' WHERE status='running'")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_action_requests_actor_created ON action_requests (tg_id, created_at DESC)")
 
     c.execute('''CREATE TABLE IF NOT EXISTS ops_templates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,3 +260,38 @@ def bind_legacy_subscription(db_file: str, subscription_id: int, user_id: int, t
         raise
     finally:
         conn.close()
+
+
+def create_action_request(db_file: str, tg_id: int, user_id: int, action: str, payload: dict | None = None) -> str:
+    action_id = secrets.token_hex(8)
+    now = int(time.time())
+    db_execute(
+        db_file,
+        """INSERT INTO action_requests
+        (id, tg_id, user_id, action, payload_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+        (action_id, int(tg_id), int(user_id), action, json.dumps(payload or {}), now, now),
+    )
+    return action_id
+
+
+def get_action_request(db_file: str, action_id: str):
+    row = db_query(db_file, "SELECT * FROM action_requests WHERE id=?", (action_id,), one=True)
+    return dict(row) if row else None
+
+
+def claim_action_request(db_file: str, action_id: str, tg_id: int, action: str) -> bool:
+    now = int(time.time())
+    return bool(db_execute(
+        db_file,
+        """UPDATE action_requests SET status='running', updated_at=?
+        WHERE id=? AND tg_id=? AND action=? AND status='pending' AND created_at>=?""",
+        (now, action_id, int(tg_id), action, now - 900),
+    ))
+
+
+def finish_action_request(db_file: str, action_id: str, status: str) -> None:
+    if status not in {'done', 'failed', 'unknown'}:
+        raise ValueError('invalid action completion state')
+    db_execute(db_file, "UPDATE action_requests SET status=?, updated_at=? WHERE id=? AND status='running'",
+               (status, int(time.time()), action_id))

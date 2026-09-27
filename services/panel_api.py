@@ -185,14 +185,15 @@ def _build_request_kwargs(json_data: Optional[dict[str, Any]] = None, params: Op
         kwargs["params"] = params
     return kwargs
 
-async def safe_api_request(method, endpoint, panel_url, headers, verify_tls=True, json_data=None, params=None):
+async def safe_api_request(method, endpoint, panel_url, headers, verify_tls=True, json_data=None, params=None, retry=True):
     if not panel_url or not panel_url.startswith(('http://', 'https://')):
         raise PanelApiError("Panel URL is not configured")
     if not headers.get('Authorization', '').removeprefix('Bearer ').strip():
         raise PanelApiError("Panel token is not configured")
     url = f"{panel_url.rstrip('/')}{endpoint}"
     client = _get_client(verify_tls)
-    max_attempts = 3
+    # Non-idempotent actions opt out: a lost response must not replay a write.
+    max_attempts = 3 if retry else 1
 
     for attempt in range(1, max_attempts + 1):
         resp = None
@@ -314,11 +315,13 @@ async def create_user(payload, panel_url, headers, verify_tls=True):
     return await safe_api_request('POST', '/users', panel_url, headers, verify_tls, json_data=payload)
 
 
-async def patch_user(payload, panel_url, headers, verify_tls=True):
+async def patch_user(payload, panel_url, headers, verify_tls=True, *, retry=True):
     if not isinstance(payload, dict) or 'id' not in payload or set(payload) - UPDATE_USER_FIELDS:
         raise ValueError("UpdateUserBodyDto requires a numeric id")
     payload = {**payload, 'id': require_user_id(payload['id'])}
-    return await safe_api_request('PATCH', '/users', panel_url, headers, verify_tls, json_data=payload)
+    kwargs = {} if retry else {'retry': False}
+    return await safe_api_request('PATCH', '/users', panel_url, headers, verify_tls, json_data=payload,
+                                  **kwargs)
 
 
 async def delete_user(user_id, panel_url, headers, verify_tls=True):
@@ -388,6 +391,12 @@ async def run_bulk_action(action, user_ids, extra, panel_url, headers, verify_tl
             expected = 204
         elif action == 'reset':
             response = await bulk_reset_traffic_users(batch, panel_url, headers, verify_tls)
+            expected = 202
+        elif action == 'extend':
+            response = await bulk_extend_expiration(batch, extra['days'], panel_url, headers, verify_tls)
+            expected = 204
+        elif action == 'revoke':
+            response = await bulk_revoke_subscriptions(batch, panel_url, headers, verify_tls)
             expected = 202
         else:
             if action == 'disable':
@@ -472,3 +481,141 @@ async def get_user_accessible_nodes(user_id, panel_url, headers, verify_tls=True
     resp = await safe_api_request('GET', f'/users/{require_user_id(user_id)}/accessible-nodes',
                                   panel_url, headers, verify_tls)
     return _required_list(_expect_payload(resp, dict), 'activeNodes')
+
+
+def _positive_days(days: int, *, maximum: int | None = None) -> int:
+    if isinstance(days, bool) or not isinstance(days, int) or days < 1 or (maximum is not None and days > maximum):
+        raise ValueError('days must be a positive integer within the contract range')
+    return days
+
+
+def _hwid_devices_payload(resp):
+    payload = _expect_payload(resp, dict)
+    _required_list(payload, 'devices')
+    if isinstance(payload.get('total'), bool) or not isinstance(payload.get('total'), (int, float)):
+        raise PanelContractError('HWID response is missing numeric total')
+    return payload
+
+
+async def get_user_hwid_devices(user_id, panel_url, headers, verify_tls=True):
+    resp = await safe_api_request('GET', f'/hwid/devices/{require_user_id(user_id)}', panel_url, headers, verify_tls)
+    return _hwid_devices_payload(resp)
+
+
+async def delete_user_hwid_device(user_id, hwid, panel_url, headers, verify_tls=True):
+    if not isinstance(hwid, str) or not hwid:
+        raise ValueError('HWID must be a nonempty string')
+    resp = await safe_api_request('POST', '/hwid/devices/delete', panel_url, headers, verify_tls,
+                                  json_data={'userId': require_user_id(user_id), 'hwid': hwid}, retry=False)
+    return _hwid_devices_payload(resp)
+
+
+async def delete_all_user_hwid_devices(user_id, panel_url, headers, verify_tls=True):
+    resp = await safe_api_request('POST', '/hwid/devices/delete-all', panel_url, headers, verify_tls,
+                                  json_data={'userId': require_user_id(user_id)}, retry=False)
+    return _hwid_devices_payload(resp)
+
+
+async def get_hwid_devices_stats(panel_url, headers, verify_tls=True):
+    payload = _expect_payload(await safe_api_request('GET', '/hwid/devices/stats', panel_url, headers, verify_tls), dict)
+    _required_list(payload, 'byPlatform')
+    if not isinstance(payload.get('stats'), dict):
+        raise PanelContractError('HWID stats response is missing stats')
+    return payload
+
+
+async def get_top_users_by_hwid_devices(panel_url, headers, size=5, verify_tls=True):
+    if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 100:
+        raise ValueError('HWID top users size must be 1 to 100')
+    payload = _expect_payload(await safe_api_request('GET', '/hwid/devices/top-users', panel_url, headers,
+                                                      verify_tls, params={'start': 0, 'size': size}), dict)
+    _required_list(payload, 'users')
+    return payload
+
+
+async def revoke_user_subscription(user_id, panel_url, headers, revoke_only_passwords=False, verify_tls=True):
+    if not isinstance(revoke_only_passwords, bool):
+        raise ValueError('revokeOnlyPasswords must be boolean')
+    resp = await safe_api_request('POST', f'/users/{require_user_id(user_id)}/actions/revoke',
+                                  panel_url, headers, verify_tls,
+                                  json_data={'revokeOnlyPasswords': revoke_only_passwords}, retry=False)
+    return _validate_user(_expect_payload(resp, dict))
+
+
+async def extend_user_expiration(user_id, days, panel_url, headers, verify_tls=True):
+    resp = await safe_api_request('POST', f'/users/{require_user_id(user_id)}/actions/extend',
+                                  panel_url, headers, verify_tls, json_data={'days': _positive_days(days)}, retry=False)
+    return _validate_user(_expect_payload(resp, dict))
+
+
+async def bulk_extend_expiration(user_ids, days, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', '/users/bulk/extend-expiration-date', panel_url, headers,
+                                  verify_tls, json_data={'userIds': require_user_ids(user_ids),
+                                                         'extendDays': _positive_days(days, maximum=9999)}, retry=False)
+
+
+async def bulk_revoke_subscriptions(user_ids, panel_url, headers, verify_tls=True):
+    return await safe_api_request('POST', '/users/bulk/revoke-subscription', panel_url, headers,
+                                  verify_tls, json_data={'userIds': require_user_ids(user_ids)}, retry=False)
+
+
+async def start_node_geocheck(node_uuid, panel_url, headers, verify_tls=True):
+    resp = await safe_api_request('POST', f'/connections/geocheck/{require_uuid(node_uuid)}',
+                                  panel_url, headers, verify_tls, json_data={}, retry=False)
+    if resp.status_code != 201:
+        raise PanelApiError(f'Panel returned HTTP {resp.status_code} for GeoCheck start')
+    payload = _expect_payload(resp, dict)
+    if not isinstance(payload.get('jobId'), str) or not payload['jobId']:
+        raise PanelContractError('GeoCheck response is missing jobId')
+    return payload['jobId']
+
+
+async def get_node_geocheck_result(job_id, panel_url, headers, verify_tls=True):
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError('GeoCheck jobId must be nonempty')
+    resp = await safe_api_request('GET', f'/connections/geocheck/{quote(job_id, safe="")}',
+                                  panel_url, headers, verify_tls, retry=False)
+    payload = _expect_payload(resp, dict)
+    if not isinstance(payload.get('isCompleted'), bool) or not isinstance(payload.get('isFailed'), bool):
+        raise PanelContractError('GeoCheck result is missing completion flags')
+    if payload.get('result') is not None and not isinstance(payload['result'], dict):
+        raise PanelContractError('GeoCheck result has invalid result data')
+    return payload
+
+
+async def get_system_stats_digest(start, end, panel_url, headers, verify_tls=True):
+    resp = await safe_api_request('GET', '/system/stats/digest', panel_url, headers, verify_tls,
+                                  params={'start': start, 'end': end})
+    return _expect_payload(resp, dict)
+
+
+async def get_system_http_stats(panel_url, headers, verify_tls=True):
+    payload = _expect_payload(await safe_api_request('GET', '/system/stats/http', panel_url, headers, verify_tls), dict)
+    _required_list(payload, 'routes')
+    return payload
+
+
+async def get_system_nodes_metrics(panel_url, headers, verify_tls=True):
+    payload = _expect_payload(await safe_api_request('GET', '/system/nodes/metrics', panel_url, headers, verify_tls), dict)
+    _required_list(payload, 'nodes')
+    return payload
+
+
+async def resolve_panel_user(field, value, panel_url, headers, verify_tls=True):
+    if field not in {'id', 'shortUuid', 'username'}:
+        raise ValueError('ResolveUserBodyDto accepts exactly one identity field')
+    if field == 'id':
+        value = require_user_id(value)
+    elif not isinstance(value, str) or not value:
+        raise ValueError('Resolve identity must be nonempty')
+    resp = await safe_api_request('POST', '/users/resolve', panel_url, headers, verify_tls,
+                                  json_data={field: value})
+    payload = _expect_payload(resp, dict, allow_404=True)
+    if payload is not None and (isinstance(payload.get('id'), bool) or not isinstance(payload.get('id'), int)):
+        raise PanelContractError('Resolve response is missing numeric id')
+    return payload
+
+
+async def get_panel_user_tags(panel_url, headers, verify_tls=True):
+    payload = _expect_payload(await safe_api_request('GET', '/users/tags', panel_url, headers, verify_tls), dict)
+    return _required_list(payload, 'tags')

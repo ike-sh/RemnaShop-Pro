@@ -7,6 +7,8 @@ STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
 STATUS_DELIVERED = "delivered"
 STATUS_FAILED = "failed"
+STATUS_UNKNOWN = "unknown"
+STATUS_EXTENSION_APPLIED = "extension_applied"
 
 logger = logging.getLogger(__name__)
 

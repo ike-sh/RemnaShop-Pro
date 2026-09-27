@@ -1,6 +1,6 @@
 # 🚀 RemnaShop-Pro
 
-当前版本：`V3.7`
+当前版本：`V3.8`
 
 RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 机器人，提供订阅售卖、续费、状态查询与基础运维能力。
 
@@ -11,7 +11,8 @@ RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 机器人，提�
 [API 清单](docs/remnawave-api-inventory.md)、
 [3.x 迁移说明](docs/remnawave-v3-migration.md) 和
 [V3.7 RC 验收步骤](docs/v3.7-rc-runbook.md)、
-[人工 UI 清单](docs/v3.7-rc-ui-checklist.md)。
+[人工 UI 清单](docs/v3.7-rc-ui-checklist.md) 和
+[V3.8 发布说明](docs/releases/v3.8.md)。
 
 ---
 
@@ -22,6 +23,8 @@ RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 机器人，提�
 - 我的订阅 / 续费
 - 订阅详情查看（到期时间、状态、流量使用）
 - 订阅链接二维码生成
+- 查看和清理本人 HWID 设备、重置订阅凭据；重置后展示面板返回的最新链接和二维码
+- 已有订阅续费用官方 Extend Action；结果不确定时订单进入人工核对状态，禁止重复执行
 - 节点状态查询
 - 联系客服
 
@@ -29,6 +32,9 @@ RemnaShop-Pro 是一个面向 **Remnawave 面板** 的 Telegram 机器人，提�
 - 套餐管理（新增、查看、删除）
 - 用户列表与订阅管理（查看、删除、重置流量、重置策略）
 - 订单审核（通过 / 拒绝）
+- 批量续期、批量撤销订阅（选定数值用户 ID、执行前确认）
+- HWID 设备管理与统计、节点 GeoCheck、系统 Dashboard
+- 面板用户 ID / shortUuid / 用户名 Resolve 检索和 Panel Tags 查看
 - 到期提醒天数设置
 - 过期清理天数设置
 - 异常检测阈值与检测周期设置
