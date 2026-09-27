@@ -10,11 +10,31 @@ def _connect(db_file: str) -> sqlite3.Connection:
     return conn
 
 
+def _add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db(db_file: str) -> None:
     conn = _connect(db_file)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _init_db_on_connection(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _init_db_on_connection(conn: sqlite3.Connection) -> None:
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS plans (key TEXT PRIMARY KEY, name TEXT, price TEXT, usdt_price TEXT, days INTEGER, gb INTEGER, reset_strategy TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, uuid TEXT, created_at TIMESTAMP)''')
+    _add_column(conn, "subscriptions", "user_id", "INTEGER")
+    _add_column(conn, "subscriptions", "migration_status", "TEXT")
     try:
         c.execute("ALTER TABLE subscriptions ADD COLUMN plan_key TEXT")
     except sqlite3.OperationalError:
@@ -63,6 +83,8 @@ def init_db(db_file: str) -> None:
             updated_at INTEGER NOT NULL
         )'''
     )
+    _add_column(conn, "orders", "target_user_id", "INTEGER")
+    _add_column(conn, "orders", "delivered_user_id", "INTEGER")
 
 
     try:
@@ -75,6 +97,7 @@ def init_db(db_file: str) -> None:
         user_uuid TEXT UNIQUE,
         created_at INTEGER NOT NULL
     )''')
+    _add_column(conn, "anomaly_whitelist", "user_id", "INTEGER")
 
     c.execute('''CREATE TABLE IF NOT EXISTS order_audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +119,14 @@ def init_db(db_file: str) -> None:
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )''')
+    _add_column(conn, "bulk_jobs", "attempts", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "bulk_jobs", "next_attempt_at", "INTEGER NOT NULL DEFAULT 0")
+    # A lost response can mean a destructive request was already accepted.
+    # Never replay reset/delete automatically after a crash or timeout.
+    c.execute("""UPDATE bulk_jobs SET status='unknown'
+                 WHERE status IN ('running','retry') AND action IN ('reset','delete')""")
+    c.execute("""UPDATE bulk_jobs SET status='pending'
+                 WHERE status='running' AND action NOT IN ('reset','delete')""")
 
     c.execute('''CREATE TABLE IF NOT EXISTS ops_templates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,14 +148,25 @@ def init_db(db_file: str) -> None:
         evidence_summary TEXT,
         created_at INTEGER NOT NULL
     )''')
+    _add_column(conn, "anomaly_events", "user_id", "INTEGER")
+
+    # Preserve every legacy UUID. Resolution to a Panel v3 numeric ID occurs
+    # only after a unique, verified match; ambiguous records remain visible.
+    c.execute("""UPDATE subscriptions SET migration_status='pending'
+                 WHERE user_id IS NULL AND migration_status IS NULL""")
+    c.execute("""UPDATE subscriptions SET migration_status='resolved'
+                 WHERE user_id IS NOT NULL AND migration_status IS NULL""")
 
     c.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_tg_id ON subscriptions (tg_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_uuid ON subscriptions (uuid)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_user_id_unique ON subscriptions (user_id) WHERE user_id IS NOT NULL")
     c.execute("CREATE INDEX IF NOT EXISTS idx_orders_tg_id_status ON orders (tg_id, status)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders (order_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders (status, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_order_audit_order_id ON order_audit_logs (order_id, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_events_user_created ON anomaly_events (user_uuid, created_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_anomaly_events_user_id_created ON anomaly_events (user_id, created_at DESC)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_anomaly_whitelist_user_id ON anomaly_whitelist (user_id) WHERE user_id IS NOT NULL")
     c.execute("CREATE INDEX IF NOT EXISTS idx_bulk_jobs_status_created ON bulk_jobs (status, created_at DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ops_templates_created ON ops_templates (created_at DESC)")
 
@@ -141,10 +183,6 @@ def init_db(db_file: str) -> None:
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO plans (key, name, price, usdt_price, days, gb, reset_strategy) VALUES (?, ?, ?, ?, ?, ?, ?)", ('p1', '1个月', '200元', '28', 30, 100, 'NO_RESET'))
         c.execute("INSERT INTO plans (key, name, price, usdt_price, days, gb, reset_strategy) VALUES (?, ?, ?, ?, ?, ?, ?)", ('p2', '3个月', '580元', '82', 90, 500, 'NO_RESET'))
-
-    conn.commit()
-    conn.close()
-
 
 def db_query(db_file: str, query: str, args: Iterable[Any] = (), one: bool = False):
     conn = _connect(db_file)
@@ -163,3 +201,43 @@ def db_execute(db_file: str, query: str, args: Iterable[Any] = ()) -> int:
     changed = cur.rowcount
     conn.close()
     return changed
+
+
+def bind_legacy_subscription(db_file: str, subscription_id: int, user_id: int, tg_id: int) -> None:
+    """Atomically attach a verified Panel v3 ID without discarding legacy references."""
+    if isinstance(user_id, bool) or int(user_id) <= 0:
+        raise ValueError("Panel user ID must be positive")
+    conn = _connect(db_file)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT tg_id, uuid, user_id FROM subscriptions WHERE id=?", (subscription_id,)
+        ).fetchone()
+        if row is None or int(row["tg_id"]) != int(tg_id):
+            raise ValueError("Legacy subscription does not belong to this Telegram user")
+        if row["user_id"] is not None:
+            if int(row["user_id"]) == int(user_id):
+                conn.commit()
+                return
+            raise ValueError("Subscription is already bound to a different Panel user")
+        duplicate = conn.execute(
+            "SELECT id FROM subscriptions WHERE user_id=? AND id<>?", (user_id, subscription_id)
+        ).fetchone()
+        if duplicate:
+            raise ValueError("Panel user is already linked to another subscription")
+        legacy_uuid = row["uuid"]
+        conn.execute(
+            "UPDATE subscriptions SET user_id=?, migration_status='resolved' WHERE id=?",
+            (user_id, subscription_id),
+        )
+        if legacy_uuid:
+            conn.execute("UPDATE orders SET target_user_id=? WHERE target_uuid=?", (user_id, legacy_uuid))
+            conn.execute("UPDATE orders SET delivered_user_id=? WHERE delivered_uuid=?", (user_id, legacy_uuid))
+            conn.execute("UPDATE OR IGNORE anomaly_whitelist SET user_id=? WHERE user_uuid=?", (user_id, legacy_uuid))
+            conn.execute("UPDATE anomaly_events SET user_id=? WHERE user_uuid=?", (user_id, legacy_uuid))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

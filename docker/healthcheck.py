@@ -25,13 +25,16 @@ for key in ("admin_id", "bot_token"):
     if not str(cfg.get(key, "")).strip():
         fail(f"missing config key: {key}")
 
-if db_path.exists():
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA quick_check;").fetchone()
-        conn.close()
-    except Exception as exc:
-        fail(f"database check failed: {exc}")
+if not db_path.exists():
+    fail(f"missing database: {db_path}")
+try:
+    conn = sqlite3.connect(db_path)
+    result = conn.execute("PRAGMA quick_check;").fetchone()
+    conn.close()
+    if not result or result[0] != "ok":
+        fail("database integrity check failed")
+except Exception as exc:
+    fail(f"database check failed: {exc}")
 
 print("ok")
 sys.exit(0)

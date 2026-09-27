@@ -14,8 +14,8 @@ def build_anomaly_incidents(logs, last_scan_ts, whitelist, ip_threshold):
         if ts > max_seen_ts:
             max_seen_ts = ts
 
-        uid = item.get('userUuid')
-        ip = item.get('ip') or item.get('requestIp')
+        uid = item.get('userId')
+        ip = item.get('requestIp')
         ua = item.get('userAgent') or ''
         if not uid or uid in whitelist or not ip:
             continue
@@ -35,8 +35,8 @@ def build_anomaly_incidents(logs, last_scan_ts, whitelist, ip_threshold):
         evidence = []
         for row in user_logs.get(uid, [])[:10]:
             evidence.append({
-                "ts": row.get('_fmt_time') or row.get('requestAt') or row.get('createdAt') or '-',
-                "ip": row.get('ip') or row.get('requestIp') or '-',
+                "ts": row.get('_fmt_time') or row.get('requestAt') or '-',
+                "ip": row.get('requestIp') or '-',
                 "ua": (row.get('userAgent') or '-')[:40],
             })
         incidents.append({

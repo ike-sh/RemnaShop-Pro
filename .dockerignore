@@ -17,3 +17,10 @@ __pycache__/
 venv/
 data/
 .env
+config.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+backup/

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/ike666888/RemnaShop-Pro.git}"
+REPO_URL="${REPO_URL:-https://github.com/ike-sh/RemnaShop-Pro.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/remnashop-pro}"
 BRANCH="${BRANCH:-main}"
-PROJECT_NAME="${PROJECT_NAME:-remnashop}"
+PROJECT_NAME="remnashop"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -31,9 +31,9 @@ usage() {
   bash bootstrap.sh              # 有 TTY 时显示交互菜单；否则默认执行 install
 
 公网一键安装:
-  curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootstrap.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/ike-sh/RemnaShop-Pro/main/bootstrap.sh | bash
 公网一键卸载:
-  curl -fsSL https://raw.githubusercontent.com/ike666888/RemnaShop-Pro/main/bootstrap.sh | bash -s -- uninstall
+  curl -fsSL https://raw.githubusercontent.com/ike-sh/RemnaShop-Pro/main/bootstrap.sh | bash -s -- uninstall
 USAGE
 }
 
@@ -207,17 +207,40 @@ install_docker_compose() {
 prepare_repo() {
   log "正在准备仓库目录：${INSTALL_DIR}"
   log "说明：安装目录会保留完整 git 仓库（含 docs/tests/README 等文件）；这些文件是否进入生产镜像由 Dockerfile + .dockerignore 决定。"
+  case "${INSTALL_DIR%/}" in
+    */remnashop-pro|*/RemnaShop-Pro) ;;
+    *)
+      err "安装目录必须以 remnashop-pro 命名，已停止以避免接管未知路径。"
+      exit 1
+      ;;
+  esac
+  if [ -L "${INSTALL_DIR}" ]; then
+    err "安装目录是符号链接，无法安全确认目标；安装已停止。"
+    exit 1
+  fi
 
   if [ -d "${INSTALL_DIR}/.git" ]; then
     log "检测到已有 git 仓库，正在更新..."
+    local current_remote
+    current_remote="$(git -C "${INSTALL_DIR}" remote get-url origin 2>/dev/null || true)"
+    if [ "${current_remote}" != "${REPO_URL}" ] && [ "${current_remote}" != "${REPO_URL%.git}" ]; then
+      err "现有目录的 origin 与 RemnaShop-Pro 仓库不匹配，已停止；不会接管或删除。"
+      exit 1
+    fi
+    if [ -n "$(git -C "${INSTALL_DIR}" status --porcelain)" ]; then
+      err "现有仓库包含未提交修改，请先备份或处理后再更新。"
+      exit 1
+    fi
     git -C "${INSTALL_DIR}" fetch origin
     git -C "${INSTALL_DIR}" checkout "${BRANCH}"
     git -C "${INSTALL_DIR}" pull --ff-only origin "${BRANCH}"
   else
     ${SUDO} mkdir -p "$(dirname "${INSTALL_DIR}")"
     if [ -d "${INSTALL_DIR}" ]; then
-      warn "${INSTALL_DIR} 已存在但不是 git 仓库。为避免冲突将先删除该目录。"
-      ${SUDO} rm -rf "${INSTALL_DIR}"
+      if [ -n "$(ls -A "${INSTALL_DIR}")" ]; then
+        err "${INSTALL_DIR} 已存在且非空，也不是项目 Git 仓库。请人工确认目录内容；安装已停止，未删除文件。"
+        exit 1
+      fi
     fi
     git clone --branch "${BRANCH}" --depth 1 "${REPO_URL}" "${INSTALL_DIR}"
   fi
@@ -244,6 +267,14 @@ get_env_value() {
   awk -F= -v k="${key}" '$1==k {sub(/^[^=]*=/, "", $0); print; exit}' "${env_file}"
 }
 
+valid_admin_id() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+valid_bot_token() {
+  [[ "$1" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]]
+}
+
 upsert_env_value() {
   local key="$1"
   local value="$2"
@@ -259,72 +290,77 @@ upsert_env_value() {
 }
 
 prompt_required_env() {
-  if [ ! -r /dev/tty ]; then
-    err "设置 ADMIN_ID 和 BOT_TOKEN 需要交互输入，但当前没有可用的 TTY。"
-    err "请在终端中运行（例如：curl -fsSL <raw-script-url> | bash），或先在 ${INSTALL_DIR}/.env 中预设这两个变量。"
-    exit 1
-  fi
-
   local admin_current bot_current admin_new bot_new keep
   admin_current="$(get_env_value "ADMIN_ID")"
   bot_current="$(get_env_value "BOT_TOKEN")"
+  if [ ! -r /dev/tty ]; then
+    if valid_admin_id "${admin_current}" && valid_bot_token "${bot_current}"; then
+      log "非交互安装：已检测到 .env 中配置的 ADMIN_ID 和 BOT_TOKEN。"
+      return
+    fi
+    err "设置 ADMIN_ID 和 BOT_TOKEN 需要交互输入，但当前没有可用的 TTY。"
+    err "请在终端中运行，或先在 ${INSTALL_DIR}/.env 中预设这两个变量。"
+    exit 1
+  fi
 
   echo
   log "正在配置必填环境变量（仅 ADMIN_ID 与 BOT_TOKEN）。"
 
-  if [ -n "${admin_current}" ]; then
+  if valid_admin_id "${admin_current}"; then
     printf "检测到现有 ADMIN_ID='%s'，是否保留？[Y/n]: " "${admin_current}" >/dev/tty
     read -r keep </dev/tty
     if [[ ! "${keep:-Y}" =~ ^[Yy]$ ]]; then
       while true; do
         printf "请输入 ADMIN_ID: " >/dev/tty
         read -r admin_new </dev/tty
-        if [ -n "${admin_new}" ]; then
+        if valid_admin_id "${admin_new}"; then
           upsert_env_value "ADMIN_ID" "${admin_new}"
           break
         fi
-        warn "ADMIN_ID 不能为空。"
+        warn "ADMIN_ID 必须是正整数。"
       done
     fi
   else
     while true; do
       printf "请输入 ADMIN_ID: " >/dev/tty
       read -r admin_new </dev/tty
-      if [ -n "${admin_new}" ]; then
+      if valid_admin_id "${admin_new}"; then
         upsert_env_value "ADMIN_ID" "${admin_new}"
         break
       fi
-      warn "ADMIN_ID 不能为空。"
+      warn "ADMIN_ID 必须是正整数。"
     done
   fi
 
-  if [ -n "${bot_current}" ]; then
-    printf "检测到现有 BOT_TOKEN='%s'，是否保留？[Y/n]: " "${bot_current}" >/dev/tty
+  if valid_bot_token "${bot_current}"; then
+    printf "检测到已配置 BOT_TOKEN，是否保留？[Y/n]: " >/dev/tty
     read -r keep </dev/tty
     if [[ ! "${keep:-Y}" =~ ^[Yy]$ ]]; then
       while true; do
         printf "请输入 BOT_TOKEN: " >/dev/tty
-        read -r bot_new </dev/tty
-        if [ -n "${bot_new}" ]; then
+        read -rs bot_new </dev/tty
+        printf '\n' >/dev/tty
+        if valid_bot_token "${bot_new}"; then
           upsert_env_value "BOT_TOKEN" "${bot_new}"
           break
         fi
-        warn "BOT_TOKEN 不能为空。"
+        warn "BOT_TOKEN 格式无效。"
       done
     fi
   else
     while true; do
       printf "请输入 BOT_TOKEN: " >/dev/tty
-      read -r bot_new </dev/tty
-      if [ -n "${bot_new}" ]; then
+      read -rs bot_new </dev/tty
+      printf '\n' >/dev/tty
+      if valid_bot_token "${bot_new}"; then
         upsert_env_value "BOT_TOKEN" "${bot_new}"
         break
       fi
-      warn "BOT_TOKEN 不能为空。"
+      warn "BOT_TOKEN 格式无效。"
     done
   fi
 
-  if [ -z "$(get_env_value "ADMIN_ID")" ] || [ -z "$(get_env_value "BOT_TOKEN")" ]; then
+  if ! valid_admin_id "$(get_env_value "ADMIN_ID")" || ! valid_bot_token "$(get_env_value "BOT_TOKEN")"; then
     err "${INSTALL_DIR}/.env 中必须同时设置 ADMIN_ID 和 BOT_TOKEN。"
     exit 1
   fi
@@ -420,47 +456,77 @@ verify_stack() {
   fi
 }
 
+verified_install_dir() {
+  [ -d "${INSTALL_DIR}/.git" ] || return 1
+  [ ! -L "${INSTALL_DIR}" ] || return 1
+  [ -f "${INSTALL_DIR}/bootstrap.sh" ] || return 1
+  [ -f "${INSTALL_DIR}/docker-compose.yml" ] || return 1
+  local resolved_dir
+  resolved_dir="$(cd "${INSTALL_DIR}" && pwd -P)" || return 1
+  case "${resolved_dir}" in
+    */remnashop-pro|*/RemnaShop-Pro) ;;
+    *) return 1 ;;
+  esac
+  local current_remote
+  current_remote="$(git -C "${INSTALL_DIR}" remote get-url origin 2>/dev/null || true)"
+  [ "${current_remote}" = "${REPO_URL}" ] || [ "${current_remote}" = "${REPO_URL%.git}" ]
+}
+
 uninstall_stack() {
-  if ! require_cmd docker; then
-    warn "未检测到 Docker，跳过容器/镜像/数据卷清理。"
+  if ! verified_install_dir; then
+    warn "安装目录未通过 RemnaShop-Pro 仓库校验，跳过 Docker 和目录删除；请人工检查。"
     return
+  fi
+  if ! require_cmd docker; then
+    err "未检测到 Docker，无法确认项目资源已清理；已停止卸载并保留项目目录。"
+    return 1
   fi
 
   if [ -f "${INSTALL_DIR}/docker-compose.yml" ]; then
     log "正在停止并删除 RemnaShop-Pro 的 Compose 服务栈..."
-    docker compose -f "${INSTALL_DIR}/docker-compose.yml" -p "${PROJECT_NAME}" down -v --rmi local --remove-orphans || true
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" -p "${PROJECT_NAME}" down -v --rmi local --remove-orphans
   else
     warn "未找到 ${INSTALL_DIR}/docker-compose.yml，将仅尝试按项目标签清理。"
   fi
 
   local ids
-  ids="$(docker ps -aq --filter "label=com.docker.compose.project=${PROJECT_NAME}" || true)"
+  ids="$(docker ps -aq --filter "label=com.docker.compose.project=${PROJECT_NAME}")"
   if [ -n "${ids}" ]; then
     log "正在清理项目 ${PROJECT_NAME} 的残留容器。"
-    docker rm -f ${ids} || true
+    docker rm -f ${ids}
   fi
 
   local volume_ids
-  volume_ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}" || true)"
+  volume_ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}")"
   if [ -n "${volume_ids}" ]; then
     log "正在清理项目 ${PROJECT_NAME} 的残留数据卷。"
-    docker volume rm ${volume_ids} || true
+    docker volume rm ${volume_ids}
   fi
 
   local image_ids
-  image_ids="$(docker image ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}" || true)"
+  image_ids="$(docker image ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}")"
   if [ -n "${image_ids}" ]; then
     log "正在清理项目 ${PROJECT_NAME} 的残留镜像。"
-    docker image rm ${image_ids} || true
+    docker image rm ${image_ids}
   fi
 }
 
 remove_project_directory() {
-  if [ -d "${INSTALL_DIR}" ]; then
-    log "正在删除项目目录：${INSTALL_DIR}"
-    ${SUDO} rm -rf "${INSTALL_DIR}"
+  if verified_install_dir; then
+    local resolved_dir
+    resolved_dir="$(cd "${INSTALL_DIR}" && pwd -P)"
+    case "${resolved_dir}" in
+      */remnashop-pro|*/RemnaShop-Pro)
+        ;;
+      *)
+        err "拒绝删除不符合项目目录命名的路径：${resolved_dir}"
+        return 1
+        ;;
+    esac
+    log "正在删除已验证项目目录：${resolved_dir}"
+    ${SUDO} rm -rf -- "${resolved_dir}"
   else
-    warn "项目目录不存在：${INSTALL_DIR}（可能已被删除）"
+    warn "项目目录不存在或未通过仓库校验，未删除目录：${INSTALL_DIR}"
   fi
 }
 
@@ -512,6 +578,14 @@ MSG
 }
 
 uninstall_flow() {
+  if ! verified_install_dir; then
+    if [ -e "${INSTALL_DIR}" ]; then
+      err "安装目录未通过项目仓库校验，卸载已停止，未删除任何资源。"
+      return 1
+    fi
+    warn "未找到已验证的安装目录；未执行 Docker 或目录删除。"
+    return 0
+  fi
   confirm_uninstall_if_needed
   uninstall_stack
   remove_project_directory

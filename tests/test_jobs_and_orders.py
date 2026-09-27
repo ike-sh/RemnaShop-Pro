@@ -18,12 +18,14 @@ class TestJobsAndOrders(unittest.TestCase):
                 plan_key TEXT NOT NULL,
                 order_type TEXT NOT NULL,
                 target_uuid TEXT,
+                target_user_id INTEGER,
                 status TEXT NOT NULL,
                 payment_text TEXT,
                 admin_message_id INTEGER,
                 menu_message_id INTEGER,
                 waiting_message_id INTEGER,
                 delivered_uuid TEXT,
+                delivered_user_id INTEGER,
                 error_message TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -53,13 +55,13 @@ class TestJobsAndOrders(unittest.TestCase):
 
     def test_build_anomaly_incidents(self):
         logs = [
-            {"_ts": 101, "userUuid": "u1", "requestIp": "1.1.1.1", "userAgent": "a", "_fmt_time": "t1"},
-            {"_ts": 102, "userUuid": "u1", "requestIp": "1.1.1.2", "userAgent": "b", "_fmt_time": "t2"},
-            {"_ts": 103, "userUuid": "u2", "requestIp": "2.2.2.2", "userAgent": "x", "_fmt_time": "t3"},
+            {"_ts": 101, "userId": 11, "requestIp": "1.1.1.1", "userAgent": "a", "_fmt_time": "t1"},
+            {"_ts": 102, "userId": 11, "requestIp": "1.1.1.2", "userAgent": "b", "_fmt_time": "t2"},
+            {"_ts": 103, "userId": 12, "requestIp": "2.2.2.2", "userAgent": "x", "_fmt_time": "t3"},
         ]
         incidents, max_ts = build_anomaly_incidents(logs, last_scan_ts=100, whitelist=set(), ip_threshold=1)
         self.assertEqual(max_ts, 103)
-        self.assertTrue(any(item["uid"] == "u1" for item in incidents))
+        self.assertTrue(any(item["uid"] == 11 for item in incidents))
 
     def test_classify_order_failure(self):
         self.assertEqual(classify_order_failure("timeout from api"), "network")
@@ -67,23 +69,23 @@ class TestJobsAndOrders(unittest.TestCase):
         self.assertEqual(classify_order_failure("invalid plan"), "business_validation")
 
     def test_create_order_not_reuse_when_plan_differs(self):
-        first, created_first = create_order(self._db_query, self._db_execute, 1001, "p1", "new", "0")
-        second, created_second = create_order(self._db_query, self._db_execute, 1001, "p2", "new", "0")
+        first, created_first = create_order(self._db_query, self._db_execute, 1001, "p1", "new", 0)
+        second, created_second = create_order(self._db_query, self._db_execute, 1001, "p2", "new", 0)
         self.assertTrue(created_first)
         self.assertTrue(created_second)
         self.assertNotEqual(first["order_id"], second["order_id"])
 
     def test_create_order_reuse_only_when_plan_type_target_match(self):
-        first, created_first = create_order(self._db_query, self._db_execute, 1002, "p1", "renew", "uuid-a")
-        second, created_second = create_order(self._db_query, self._db_execute, 1002, "p1", "renew", "uuid-a")
+        first, created_first = create_order(self._db_query, self._db_execute, 1002, "p1", "renew", 101)
+        second, created_second = create_order(self._db_query, self._db_execute, 1002, "p1", "renew", 101)
         self.assertTrue(created_first)
         self.assertFalse(created_second)
         self.assertEqual(first["order_id"], second["order_id"])
         self.assertEqual(second["status"], STATUS_PENDING)
 
-    def test_create_order_not_reuse_when_target_uuid_differs(self):
-        first, created_first = create_order(self._db_query, self._db_execute, 1003, "p1", "renew", "uuid-a")
-        second, created_second = create_order(self._db_query, self._db_execute, 1003, "p1", "renew", "uuid-b")
+    def test_create_order_not_reuse_when_target_user_id_differs(self):
+        first, created_first = create_order(self._db_query, self._db_execute, 1003, "p1", "renew", 101)
+        second, created_second = create_order(self._db_query, self._db_execute, 1003, "p1", "renew", 102)
         self.assertTrue(created_first)
         self.assertTrue(created_second)
         self.assertNotEqual(first["order_id"], second["order_id"])
