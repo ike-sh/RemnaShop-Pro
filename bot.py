@@ -7,7 +7,11 @@ import asyncio
 import qrcode
 from io import BytesIO
 from collections import defaultdict
-from services.panel_api import safe_api_request as api_safe_request, get_panel_user as api_get_panel_user, get_user_by_telegram_id as api_get_user_by_telegram_id, get_user_by_username as api_get_user_by_username, get_user_by_short_uuid as api_get_user_by_short_uuid, get_nodes_status as api_get_nodes_status, get_subscription_history_stats as api_get_subscription_history_stats, get_user_subscription_history as api_get_user_subscription_history, get_subscription_settings as api_get_subscription_settings, patch_subscription_settings as api_patch_subscription_settings, get_internal_squads as api_get_internal_squads, get_internal_squad_accessible_nodes as api_get_internal_squad_accessible_nodes, get_bandwidth_nodes_realtime as api_get_bandwidth_nodes_realtime, bulk_move_users_to_squad as api_bulk_move_users_to_squad, create_user as api_create_user, patch_user as api_patch_user, delete_user as api_delete_user, enable_user as api_enable_user, disable_user as api_disable_user, reset_user_traffic as api_reset_user_traffic, get_subscription_request_history as api_get_subscription_request_history, bulk_delete_users as api_bulk_delete_users, bulk_update_users as api_bulk_update_users, probe_api_capabilities as api_probe_api_capabilities, set_user_metadata as api_set_user_metadata, block_ip_address as api_block_ip_address, get_system_health as api_get_system_health, get_system_stats as api_get_system_stats, get_system_stats_recap as api_get_system_stats_recap, get_snippet_by_key as api_get_snippet_by_key, get_subscription_page_configs as api_get_subscription_page_configs, get_external_squads as api_get_external_squads, get_config_profiles as api_get_config_profiles, get_user_accessible_nodes as api_get_user_accessible_nodes, close_all_clients, extract_payload
+from services.panel_api import get_panel_user as api_get_panel_user, get_user_by_telegram_id as api_get_user_by_telegram_id, get_user_by_username as api_get_user_by_username, get_user_by_short_uuid as api_get_user_by_short_uuid, get_nodes_status as api_get_nodes_status, get_subscription_history_stats as api_get_subscription_history_stats, get_user_subscription_history as api_get_user_subscription_history, get_subscription_settings as api_get_subscription_settings, patch_subscription_settings as api_patch_subscription_settings, get_internal_squads as api_get_internal_squads, get_internal_squad_accessible_nodes as api_get_internal_squad_accessible_nodes, get_bandwidth_nodes_usage as api_get_bandwidth_nodes_usage, bulk_move_users_to_squad as api_bulk_move_users_to_squad, create_user as api_create_user, patch_user as api_patch_user, delete_user as api_delete_user, enable_user as api_enable_user, disable_user as api_disable_user, reset_user_traffic as api_reset_user_traffic, get_subscription_request_history as api_get_subscription_request_history, bulk_delete_users as api_bulk_delete_users, bulk_update_users as api_bulk_update_users, get_contract_capabilities as api_get_contract_capabilities, set_user_metadata as api_set_user_metadata, block_ip_address as api_block_ip_address, get_system_health as api_get_system_health, get_system_stats as api_get_system_stats, get_system_stats_recap as api_get_system_stats_recap, get_snippet_by_key as api_get_snippet_by_key, get_subscription_page_configs as api_get_subscription_page_configs, get_external_squads as api_get_external_squads, get_config_profiles as api_get_config_profiles, get_user_accessible_nodes as api_get_user_accessible_nodes, close_all_clients, extract_payload
+from services.panel_api import PanelApiError, PanelContractError, AmbiguousPanelUserError, api_base_url
+from services.panel_api import get_users_by_telegram_id as api_get_users_by_telegram_id
+from services.panel_api import subscription_settings_patch_from_current
+from services.panel_api import run_bulk_action as api_run_bulk_action
 from services.orders import (
     create_order,
     get_order,
@@ -23,9 +27,9 @@ from services.orders import (
     STATUS_DELIVERED,
     STATUS_FAILED,
 )
-from storage.db import init_db as storage_init_db, db_query as storage_db_query, db_execute as storage_db_execute
+from storage.db import init_db as storage_init_db, db_query as storage_db_query, db_execute as storage_db_execute, bind_legacy_subscription
 from utils.formatting import escape_markdown_v2
-from handlers.bulk_actions import parse_uuids, parse_expire_days_and_uuids, parse_traffic_and_uuids, run_bulk_action
+from handlers.bulk_actions import parse_user_ids, parse_expire_days_and_user_ids, parse_traffic_and_user_ids
 from handlers.admin import format_order_detail, format_order_row, order_status_label
 from handlers.client import build_nodes_status_message
 from jobs.anomaly import build_anomaly_incidents
@@ -59,7 +63,7 @@ config = load_config()
 
 ADMIN_ID = int(config['admin_id'])
 BOT_TOKEN = config['bot_token']
-PANEL_URL = (config.get('panel_url') or '').rstrip('/') + '/api' if (config.get('panel_url') or '').strip() else ''
+PANEL_URL = api_base_url(config.get('panel_url'))
 PANEL_TOKEN = config.get('panel_token', '')
 SUB_DOMAIN = (config.get('sub_domain') or '').rstrip('/')
 TARGET_GROUP_UUID = config.get('group_uuid', '')
@@ -72,7 +76,7 @@ logger = logging.getLogger(__name__)
 
 user_cooldowns = {}
 COOLDOWN_SECONDS = 1.0
-uuid_map = {}
+user_id_map = {}
 order_payment_method_cache = {}
 panel_capabilities_cache = {}
 panel_capabilities_runtime_success = {}
@@ -158,15 +162,15 @@ async def cleanup_admin_reply_prompt(context: ContextTypes.DEFAULT_TYPE, admin_i
         ok = await delete_message_if_possible(context, admin_id, prompt_id)
         logger.info("cleanup admin reply prompt: admin=%s prompt=%s reason=%s deleted=%s", admin_id, prompt_id, reason, ok)
 
-def get_short_id(real_uuid):
-    for sid, uid in uuid_map.items():
-        if uid == real_uuid: return sid
-    short_id = str(len(uuid_map) + 1)
-    uuid_map[short_id] = real_uuid
+def get_short_id(panel_user_id):
+    for sid, uid in user_id_map.items():
+        if uid == panel_user_id: return sid
+    short_id = str(len(user_id_map) + 1)
+    user_id_map[short_id] = panel_user_id
     return short_id
 
-def get_real_uuid(short_id):
-    return uuid_map.get(short_id)
+def get_panel_user_id_from_short(short_id):
+    return user_id_map.get(short_id)
 
 def check_cooldown(user_id):
     if user_id == ADMIN_ID: return True
@@ -223,18 +227,26 @@ def db_execute(query, args=()):
 def ensure_local_subscription_sync(tg_id, panel_user):
     if not isinstance(panel_user, dict):
         return None
-    user_uuid = (panel_user.get('uuid') or '').strip()
-    if not user_uuid:
+    panel_user_id = panel_user.get('id')
+    if not isinstance(panel_user_id, int) or panel_user_id <= 0 or panel_user.get('telegramId') != int(tg_id):
         return None
-    exists = db_query("SELECT id FROM subscriptions WHERE uuid = ?", (user_uuid,), one=True)
+    exists = db_query("SELECT id FROM subscriptions WHERE user_id = ?", (panel_user_id,), one=True)
     if exists:
-        return user_uuid
+        return panel_user_id
+    pending = db_query(
+        "SELECT id FROM subscriptions WHERE tg_id=? AND user_id IS NULL ORDER BY id", (int(tg_id),)
+    )
+    if len(pending) == 1:
+        bind_legacy_subscription(DB_FILE, pending[0]['id'], panel_user_id, int(tg_id))
+        return panel_user_id
+    if pending:
+        return None
     now_ts = int(time.time())
     db_execute(
-        "INSERT INTO subscriptions (tg_id, uuid, created_at) VALUES (?, ?, ?)",
-        (int(tg_id), user_uuid, now_ts),
+        "INSERT INTO subscriptions (tg_id, user_id, migration_status, created_at) VALUES (?, ?, 'resolved', ?)",
+        (int(tg_id), panel_user_id, now_ts),
     )
-    return user_uuid
+    return panel_user_id
 
 
 def get_setting_value(key, default=None):
@@ -329,7 +341,7 @@ def push_subscription_settings_snapshot(payload, source='手动变更前快照')
     hist.append({
         'ts': int(time.time()),
         'source': source,
-        'payload': payload,
+        'payload': subscription_settings_patch_from_current(payload),
     })
     set_json_setting('subscription_settings_history', hist[-10:])
 
@@ -354,13 +366,14 @@ def set_risk_watchlist(items):
     set_json_setting('risk_watchlist', sorted({str(x) for x in items if x}))
 
 
-def enqueue_bulk_job(action, uuids, extra, created_by):
+def enqueue_bulk_job(action, user_ids, extra, created_by):
     now = int(time.time())
-    payload = {'uuids': uuids, 'extra': extra or {}}
-    db_execute(
-        "INSERT INTO bulk_jobs (action, payload_json, status, created_by, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?)",
-        (action, json.dumps(payload, ensure_ascii=False), int(created_by or 0), now, now),
-    )
+    for batch in (user_ids[i:i + 500] for i in range(0, len(user_ids), 500)):
+        payload = {'userIds': batch, 'extra': extra or {}}
+        db_execute(
+            "INSERT INTO bulk_jobs (action, payload_json, status, created_by, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?)",
+            (action, json.dumps(payload, ensure_ascii=False), int(created_by or 0), now, now),
+        )
 
 
 def save_ops_template(name, payload, created_by):
@@ -386,8 +399,8 @@ def apply_template_payload(payload, actor='系统'):
     append_ops_timeline('模板', '应用运营模板', json.dumps(settings, ensure_ascii=False)[:180], actor=actor)
 
 
-async def sync_user_metadata(user_uuid, tg_id, plan_key="", order_id="", risk_level=""):
-    if not user_uuid:
+async def sync_user_metadata(user_id, tg_id, plan_key="", order_id="", risk_level=""):
+    if not user_id:
         return
     payload = {
         "tg_id": str(tg_id),
@@ -397,15 +410,15 @@ async def sync_user_metadata(user_uuid, tg_id, plan_key="", order_id="", risk_le
         "updated_at": int(time.time()),
     }
     try:
-        resp = await set_panel_user_metadata(user_uuid, payload)
-        if resp is not None and resp.status_code >= 400:
-            logger.warning("sync_user_metadata panel rejected for %s: status=%s", user_uuid, resp.status_code)
+        resp = await set_panel_user_metadata(user_id, payload)
+        if resp.status_code != 200:
+            logger.warning("sync_user_metadata panel rejected for %s: status=%s", user_id, resp.status_code)
     except Exception as exc:
-        logger.warning("sync_user_metadata failed for %s: %s", user_uuid, exc)
+        logger.warning("sync_user_metadata failed for %s: %s", user_id, exc)
 
 
 def panel_config_ready():
-    return bool(PANEL_URL and PANEL_TOKEN and SUB_DOMAIN and TARGET_GROUP_UUID)
+    return bool(PANEL_URL and PANEL_TOKEN)
 
 
 def save_runtime_config(**kwargs):
@@ -415,7 +428,7 @@ def save_runtime_config(**kwargs):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
     if 'panel_url' in kwargs:
-        PANEL_URL = kwargs.get('panel_url', '').rstrip('/') + '/api' if kwargs.get('panel_url') else ''
+        PANEL_URL = api_base_url(kwargs.get('panel_url'))
     if 'panel_token' in kwargs:
         PANEL_TOKEN = kwargs.get('panel_token', '')
     if 'sub_domain' in kwargs:
@@ -433,20 +446,8 @@ def get_headers():
     return {"Authorization": f"Bearer {PANEL_TOKEN}", "Content-Type": "application/json"}
 
 
-async def safe_api_request(method, endpoint, json_data=None):
-    if not PANEL_URL or not PANEL_TOKEN:
-        logger.warning('panel config missing, skip request %s %s', method, endpoint)
-        return None
-    start = time.time()
-    resp = await api_safe_request(method, endpoint, PANEL_URL, get_headers(), PANEL_VERIFY_TLS, json_data=json_data)
-    latency_ms = int((time.time() - start) * 1000)
-    status_code = resp.status_code if resp else None
-    logger.info("panel_call method=%s endpoint=%s status=%s latency_ms=%s", method, endpoint, status_code, latency_ms)
-    return resp
-
-
-async def get_panel_user(uuid):
-    return await api_get_panel_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def get_panel_user(user_id):
+    return await api_get_panel_user(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
 async def get_user_by_telegram_id(telegram_id):
@@ -468,8 +469,8 @@ async def get_subscription_history_stats():
     return await api_get_subscription_history_stats(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def get_user_subscription_history(uuid):
-    return await api_get_user_subscription_history(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def get_user_subscription_history(user_id):
+    return await api_get_user_subscription_history(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
 async def get_subscription_settings():
@@ -490,36 +491,18 @@ async def get_internal_squad_accessible_nodes(uuid):
 async def get_internal_squad_accessible_nodes_verbose(uuid):
     if not PANEL_URL or not PANEL_TOKEN:
         return [], 'config_missing'
-    resp = await safe_api_request('GET', f'/internal-squads/{uuid}/accessible-nodes')
-    if not resp:
-        return [], 'network_error'
-    if resp.status_code == 401:
-        return [], 'auth_unauthorized'
-    if resp.status_code == 403:
-        return [], 'auth_forbidden'
-    if resp.status_code == 404:
-        return [], 'endpoint_or_squad_not_found'
-    if resp.status_code != 200:
-        return [], f"http_{resp.status_code}"
-    payload = extract_payload(resp)
-    if isinstance(payload, list):
-        return payload, None
-    if isinstance(payload, dict):
-        nodes = payload.get('accessibleNodes')
-        if isinstance(nodes, list):
-            return nodes, None
-        nodes = payload.get('nodes')
-        if isinstance(nodes, list):
-            return nodes, None
-    return [], 'empty_payload'
+    try:
+        return await get_internal_squad_accessible_nodes(uuid), None
+    except PanelApiError as exc:
+        return [], str(exc)
 
 
-async def get_bandwidth_nodes_realtime():
-    return await api_get_bandwidth_nodes_realtime(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def get_bandwidth_nodes_usage():
+    return await api_get_bandwidth_nodes_usage(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def bulk_move_users_to_squad(uuids, squad_uuid):
-    return await api_bulk_move_users_to_squad(uuids, squad_uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def bulk_move_users_to_squad(user_ids, squad_uuid):
+    return await api_bulk_move_users_to_squad(user_ids, squad_uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
 async def create_panel_user(payload):
@@ -530,45 +513,45 @@ async def patch_panel_user(payload):
     return await api_patch_user(payload, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def delete_panel_user(uuid):
-    return await api_delete_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def delete_panel_user(user_id):
+    return await api_delete_user(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def enable_panel_user(uuid):
-    return await api_enable_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def enable_panel_user(user_id):
+    return await api_enable_user(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def disable_panel_user(uuid):
-    return await api_disable_user(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def disable_panel_user(user_id):
+    return await api_disable_user(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def reset_panel_user_traffic(uuid):
-    return await api_reset_user_traffic(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def reset_panel_user_traffic(user_id):
+    return await api_reset_user_traffic(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
 async def get_subscription_request_history():
     return await api_get_subscription_request_history(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def bulk_delete_panel_users(uuids):
-    return await api_bulk_delete_users(uuids, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def bulk_delete_panel_users(user_ids):
+    return await api_bulk_delete_users(user_ids, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def bulk_update_panel_users(uuids, fields):
-    return await api_bulk_update_users(uuids, fields, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def bulk_update_panel_users(user_ids, fields):
+    return await api_bulk_update_users(user_ids, fields, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def set_panel_user_metadata(user_uuid, metadata):
-    resp = await api_set_user_metadata(user_uuid, metadata, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
-    if resp and resp.status_code < 400:
+async def set_panel_user_metadata(user_id, metadata):
+    resp = await api_set_user_metadata(user_id, metadata, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+    if resp.status_code == 200:
         mark_panel_capability_success("metadata")
     return resp
 
 
 async def block_panel_ip(ip, reason):
     resp = await api_block_ip_address(ip, reason, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
-    if resp and resp.status_code < 400:
-        mark_panel_capability_success("ip_control")
+    if resp.status_code == 202:
+        mark_panel_capability_success("connections_drop")
     return resp
 
 
@@ -600,13 +583,13 @@ async def get_panel_config_profiles():
     return await api_get_config_profiles(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
-async def get_user_accessible_nodes(uuid):
-    return await api_get_user_accessible_nodes(uuid, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+async def get_user_accessible_nodes(user_id):
+    return await api_get_user_accessible_nodes(user_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
 
 
 async def refresh_panel_capabilities():
     global panel_capabilities_cache
-    panel_capabilities_cache = await api_probe_api_capabilities(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+    panel_capabilities_cache = await api_get_contract_capabilities(PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
     logger.info(
         "Panel capabilities static=%s runtime_success=%s",
         panel_capabilities_cache,
@@ -622,7 +605,7 @@ async def refresh_dynamic_snippets():
     for key in keys:
         payload = await get_panel_snippet(key)
         if isinstance(payload, dict):
-            value = payload.get('value') or payload.get('content') or payload.get('text')
+            value = payload.get('snippet')
             if isinstance(value, str) and value.strip():
                 rows[key] = value.strip()
     dynamic_snippets_cache = rows
@@ -635,17 +618,12 @@ async def warmup_panel_runtime_data():
     if not panel_config_ready():
         return
     await refresh_panel_capabilities()
-    health = await get_panel_system_health()
-    if health:
-        logger.info("Panel health/info loaded: keys=%s", ",".join(sorted(list(health.keys()))[:12]))
-    await refresh_dynamic_snippets()
     try:
+        health = await get_panel_system_health()
+        logger.info("Panel health loaded: keys=%s", ",".join(sorted(list(health.keys()))[:12]))
+        await refresh_dynamic_snippets()
         page_cfg = await get_panel_subscription_page_configs()
-        if isinstance(page_cfg, dict):
-            ui_hints = page_cfg.get('uiHints') if isinstance(page_cfg.get('uiHints'), dict) else {}
-            for key, value in ui_hints.items():
-                if isinstance(key, str) and isinstance(value, str) and value.strip():
-                    dynamic_snippets_cache.setdefault(key, value.strip())
+        logger.info("Panel subscription page configs=%s", len(page_cfg['configs']))
         squads = await get_panel_external_squads()
         profiles = await get_panel_config_profiles()
         logger.info("Panel inventory external_squads=%s config_profiles=%s", len(squads), len(profiles))
@@ -653,57 +631,59 @@ async def warmup_panel_runtime_data():
         logger.warning("Panel inventory warmup failed: %s", exc)
 
 
-async def apply_user_status_bulk_with_fallback(uuids, status):
-    if not uuids:
+async def warmup_panel_runtime_job(context: ContextTypes.DEFAULT_TYPE):
+    await warmup_panel_runtime_data()
+
+
+def schedule_panel_warmup(context: ContextTypes.DEFAULT_TYPE):
+    if not panel_config_ready():
         return
-    target = sorted(set(str(u) for u in uuids if u))
-    resp = await bulk_update_panel_users(target, {"status": status})
-    if resp and resp.status_code in (200, 201, 204):
+    for job in context.application.job_queue.get_jobs_by_name('warmup_panel_runtime_job'):
+        job.schedule_removal()
+    context.application.job_queue.run_once(
+        warmup_panel_runtime_job, when=1, name='warmup_panel_runtime_job'
+    )
+
+
+async def apply_user_status_bulk(user_ids, status):
+    if not user_ids:
         return
-    logger.warning("bulk status update failed, fallback to single requests status=%s count=%s", status, len(target))
-    for uid in target:
-        if status == USER_STATUS_DISABLED:
-            await disable_panel_user(uid)
-        else:
-            await patch_panel_user({"uuid": uid, "status": status})
+    target = sorted(set(int(value) for value in user_ids))
+    for start in range(0, len(target), 500):
+        resp = await bulk_update_panel_users(target[start:start + 500], {"status": status})
+        if resp.status_code != 202:
+            raise PanelApiError(f"Bulk status update failed: HTTP {resp.status_code}")
 
 
 async def build_squad_capacity_summary(max_users=60):
-    rows = db_query("SELECT DISTINCT uuid FROM subscriptions ORDER BY id DESC LIMIT ?", (max_users,))
-    uuids = [dict(r)['uuid'] for r in rows]
-    if not uuids:
+    rows = db_query("SELECT DISTINCT user_id FROM subscriptions WHERE user_id IS NOT NULL ORDER BY id DESC LIMIT ?", (max_users,))
+    user_ids = [dict(r)['user_id'] for r in rows]
+    if not user_ids:
         return "暂无订阅样本", None
-    infos = await asyncio.gather(*[get_panel_user(u) for u in uuids])
+    infos = await asyncio.gather(*[get_panel_user(user_id) for user_id in user_ids])
     counts = defaultdict(int)
     for info in infos:
         if not isinstance(info, dict):
             continue
-        squad = info.get('externalSquadUuid')
-        if not squad:
-            squads = info.get('activeInternalSquads') or []
-            if isinstance(squads, list) and squads:
-                first = squads[0]
-                if isinstance(first, dict):
-                    squad = first.get('uuid') or first.get('externalSquadUuid')
-                else:
-                    squad = str(first)
+        squads = info['activeInternalSquads']
+        squad = squads[0]['uuid'] if squads else None
         counts[squad or '未分组'] += 1
     top = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    lines = [f"样本用户数: {len(uuids)}"]
+    lines = [f"样本用户数: {len(user_ids)}"]
     for sid, cnt in top[:5]:
         lines.append(f"- `{sid}`：{cnt}")
     suggestion = None
-    if len(top) >= 2 and top[0][1] - top[-1][1] >= max(5, len(uuids) // 5):
+    if len(top) >= 2 and top[0][1] - top[-1][1] >= max(5, len(user_ids) // 5):
         suggestion = {'from': top[0][0], 'to': top[-1][0], 'count': min(10, (top[0][1]-top[-1][1])//2)}
         lines.append(f"\n建议迁移：从 `{suggestion['from']}` 向 `{suggestion['to']}` 迁移约 {suggestion['count']} 人")
     return "\n".join(lines), suggestion
 
 
 async def build_top_users_traffic(max_users=50):
-    rows = db_query("SELECT tg_id, uuid FROM subscriptions ORDER BY id DESC LIMIT ?", (max_users,))
+    rows = db_query("SELECT tg_id, user_id FROM subscriptions WHERE user_id IS NOT NULL ORDER BY id DESC LIMIT ?", (max_users,))
     if not rows:
         return []
-    pairs = [(dict(r)['tg_id'], dict(r)['uuid']) for r in rows]
+    pairs = [(dict(r)['tg_id'], dict(r)['user_id']) for r in rows]
     infos = await asyncio.gather(*[get_panel_user(u) for _, u in pairs])
     data = []
     for (tg_id, uid), info in zip(pairs, infos):
@@ -712,26 +692,6 @@ async def build_top_users_traffic(max_users=50):
         used = int((info.get('userTraffic') or {}).get('usedTrafficBytes', 0) or 0)
         data.append((tg_id, uid, used))
     return sorted(data, key=lambda x: x[2], reverse=True)[:5]
-
-
-def detect_bandwidth_volatility(nodes_rt):
-    prev = get_json_setting('bandwidth_last_nodes', {})
-    if not isinstance(prev, dict):
-        prev = {}
-    alerts = []
-    curr = {}
-    for it in nodes_rt:
-        name = it.get('name') or it.get('nodeName') or '未知节点'
-        val = int(it.get('totalTrafficBytes') or it.get('trafficBytes') or 0)
-        curr[name] = val
-        old = int(prev.get(name, 0) or 0)
-        if old > 0:
-            delta = val - old
-            ratio = abs(delta) / old
-            if abs(delta) >= 1024**3 and ratio >= 0.5:
-                alerts.append((name, delta, ratio))
-    set_json_setting('bandwidth_last_nodes', curr)
-    return alerts
 
 
 async def send_or_edit_menu(update, context, text, reply_markup, parse_mode='Markdown'):
@@ -857,8 +817,7 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             for node in nodes:
                 name = node.get('name', '未知节点')
-                status_raw = str(node.get('status', '')).lower()
-                is_online = status_raw in ['connected', 'healthy', 'online', 'active', 'true'] or node.get('isConnected') is True
+                is_online = node['isConnected']
                 icon = "🟢" if is_online else "🔴"
                 stat_text = "在线" if is_online else "离线"
                 msg_list.append(f"{icon} **{name}** | {stat_text}")
@@ -943,8 +902,8 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"渠道: `{order.get('channel_code') or '-'}`",
             f"创建时间: `{created}`",
         ]
-        if order.get('delivered_uuid'):
-            lines.append(f"发货UUID: `{order['delivered_uuid']}`")
+        if order.get('delivered_user_id'):
+            lines.append(f"面板用户ID: `{order['delivered_user_id']}`")
         if order.get('error_message'):
             lines.append(f"失败原因: `{order['error_message']}`")
         kb = []
@@ -970,33 +929,53 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif data == "client_status":
         subs = db_query("SELECT * FROM subscriptions WHERE tg_id = ?", (user_id,))
         if not subs:
-            panel_user = await get_user_by_telegram_id(user_id)
+            try:
+                panel_user = await get_user_by_telegram_id(user_id)
+            except AmbiguousPanelUserError:
+                await send_or_edit_menu(update, context, "⚠️ 多个面板用户使用此 Telegram ID，请联系管理员核对绑定。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+                return
+            except PanelApiError:
+                await send_or_edit_menu(update, context, "⚠️ 面板查询失败，请稍后重试。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+                return
             synced_uuid = ensure_local_subscription_sync(user_id, panel_user)
             if synced_uuid:
-                append_ops_timeline('数据修复', '按TG ID自动补齐订阅映射', f'tg_id={user_id},uuid={synced_uuid}', actor='system')
+                append_ops_timeline('数据修复', '按TG ID自动补齐订阅映射', f'tg_id={user_id},user_id={synced_uuid}', actor='system')
                 subs = db_query("SELECT * FROM subscriptions WHERE tg_id = ?", (user_id,))
-        if not subs:
-            await send_or_edit_menu(update, context, "❌ 您名下没有订阅。\n请点击“购买新订阅”。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+        mapped_subs = [sub for sub in subs if sub['user_id'] is not None]
+        pending_count = len(subs) - len(mapped_subs)
+        subscription_list_title = "👤 **我的订阅列表**\n请点击下方按钮查看详情："
+        if pending_count:
+            subscription_list_title += f"\n⚠️ 另有 {pending_count} 条旧订阅等待管理员核对迁移。"
+        if not mapped_subs:
+            message = "⚠️ 旧订阅正在等待管理员核对迁移，请勿重复购买。" if subs else "❌ 您名下没有订阅。\n请点击“购买新订阅”。"
+            await send_or_edit_menu(update, context, message, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
             return
         try: await query.edit_message_text("🔄 正在加载订阅列表...")
         except Exception as exc:
             logger.debug("failed to delete view_sub message: %s", exc)
-        tasks = [get_panel_user(sub['uuid']) for sub in subs]
+        tasks = [get_panel_user(sub['user_id']) for sub in mapped_subs]
         results = await asyncio.gather(*tasks)
         keyboard = []
         valid_count = 0
         for i, info in enumerate(results):
-            sub_db = subs[i]
+            sub_db = mapped_subs[i]
             if not info: continue
             valid_count += 1
             limit = info.get('trafficLimitBytes', 0)
             used = info.get('userTraffic', {}).get('usedTrafficBytes', 0)
             remain_gb = round((limit - used) / (1024**3), 1)
-            sid = get_short_id(sub_db['uuid'])
+            sid = get_short_id(sub_db['user_id'])
             btn_text = f"📦 订阅 #{valid_count} | 剩余 {remain_gb} GB"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"view_sub_{sid}")])
         if valid_count == 0:
-            panel_user = await get_user_by_telegram_id(user_id)
+            try:
+                panel_user = await get_user_by_telegram_id(user_id)
+            except AmbiguousPanelUserError:
+                await send_or_edit_menu(update, context, "⚠️ 多个面板用户使用此 Telegram ID，请联系管理员核对绑定。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+                return
+            except PanelApiError:
+                await send_or_edit_menu(update, context, "⚠️ 面板查询失败，请稍后重试。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+                return
             synced_uuid = ensure_local_subscription_sync(user_id, panel_user)
             if synced_uuid:
                 info = await get_panel_user(synced_uuid)
@@ -1006,17 +985,17 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     remain_gb = round((limit - used) / (1024**3), 1)
                     sid = get_short_id(synced_uuid)
                     keyboard = [[InlineKeyboardButton(f"📦 订阅 #1 | 剩余 {remain_gb} GB", callback_data=f"view_sub_{sid}")], [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]]
-                    append_ops_timeline('数据修复', '按TG ID恢复订阅入口', f'tg_id={user_id},uuid={synced_uuid}', actor='system')
-                    await send_or_edit_menu(update, context, "👤 **我的订阅列表**\n请点击下方按钮查看详情：", InlineKeyboardMarkup(keyboard))
+                    append_ops_timeline('数据修复', '按TG ID恢复订阅入口', f'tg_id={user_id},user_id={synced_uuid}', actor='system')
+                    await send_or_edit_menu(update, context, subscription_list_title, InlineKeyboardMarkup(keyboard))
                     return
             await send_or_edit_menu(update, context, "⚠️ 您的所有订阅似乎都已失效。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
             return
         keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")])
-        await send_or_edit_menu(update, context, "👤 **我的订阅列表**\n请点击下方按钮查看详情：", InlineKeyboardMarkup(keyboard))
+        await send_or_edit_menu(update, context, subscription_list_title, InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("view_sub_"):
         short_id = data.split("_")[2]
-        target_uuid = get_real_uuid(short_id)
+        target_uuid = get_panel_user_id_from_short(short_id)
         if not target_uuid:
             await query.answer("❌ 按钮已过期")
             return
@@ -1048,12 +1027,12 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif data.startswith("selrenew_"):
         short_id = data.split("_")[1]
-        target_uuid = get_real_uuid(short_id)
+        target_uuid = get_panel_user_id_from_short(short_id)
         if not target_uuid:
             await query.answer("❌ 信息过期")
             return
         
-        sub_record = db_query("SELECT * FROM subscriptions WHERE uuid = ?", (target_uuid,), one=True)
+        sub_record = db_query("SELECT * FROM subscriptions WHERE user_id = ?", (target_uuid,), one=True)
         original_plan_key = None
         if sub_record:
             sub_dict = dict(sub_record)
@@ -1125,6 +1104,14 @@ async def show_payment_method_menu(update, context, plan_key, order_type, short_
     if not plan:
         await send_or_edit_menu(update, context, "⚠️ 套餐不存在或已下架，请返回重新选择。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
         return
+
+    if not panel_config_ready() or (order_type == 'new' and not TARGET_GROUP_UUID):
+        await send_or_edit_menu(
+            update, context, "⚠️ 面板地址、Token 或新购所需默认内部组尚未配置，请联系管理员。",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]),
+        )
+        return
+
     plan_dict = dict(plan)
 
     type_str = "续费" if order_type == 'renew' else "新购"
@@ -1169,8 +1156,8 @@ async def submit_manual_review_proof(update: Update, context: ContextTypes.DEFAU
     type_str = "续费" if pending_order['order_type'] == 'renew' else "新购"
     selected_path = order_payment_method_cache.get(order_id, 'manual_review')
     selected_path_label = "USDT" if selected_path == "usdt" else "人工审核"
-    target_uuid = pending_order['target_uuid'] if pending_order['target_uuid'] else "0"
-    sid = get_short_id(target_uuid) if target_uuid != "0" else "0"
+    target_user_id = pending_order.get('target_user_id')
+    sid = get_short_id(target_user_id) if target_user_id else "0"
     username = update.effective_user.username or "-"
     proof_type = proof.get('type')
     proof_text = (proof.get('text') or '').strip()
@@ -1229,7 +1216,15 @@ async def cleanup_panelcfg_prompt_message(context: ContextTypes.DEFAULT_TYPE, ch
 
 async def handle_order_confirmation(update, context, plan_key, order_type, short_id, payment_method='manual_review'):
     user_id = update.effective_user.id
-    target_uuid = get_real_uuid(short_id) if short_id != "0" else "0"
+    target_user_id = get_panel_user_id_from_short(short_id) if short_id != "0" else None
+    if order_type == 'renew' and not target_user_id:
+        await send_or_edit_menu(update, context, "⚠️ 旧订阅尚未完成迁移，暂不能续费。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="client_status")]]))
+        return
+    if order_type == 'new' and db_query(
+        "SELECT 1 FROM subscriptions WHERE tg_id=? AND user_id IS NULL LIMIT 1", (user_id,), one=True
+    ):
+        await send_or_edit_menu(update, context, "⚠️ 旧订阅正在等待迁移核对，请先联系管理员，避免重复开通。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
+        return
 
     plan = db_query("SELECT * FROM plans WHERE key = ?", (plan_key,), one=True)
     if not plan:
@@ -1244,7 +1239,7 @@ async def handle_order_confirmation(update, context, plan_key, order_type, short
     if update.callback_query and update.callback_query.message:
         msg_id = update.callback_query.message.message_id
 
-    order, created = create_order(db_query, db_execute, user_id, plan_key, order_type, target_uuid, menu_message_id=msg_id, channel_code=context.user_data.get('channel_code'))
+    order, created = create_order(db_query, db_execute, user_id, plan_key, order_type, target_user_id, menu_message_id=msg_id, channel_code=context.user_data.get('channel_code'))
     if created:
         append_order_audit_log(db_execute, order['order_id'], 'create', user_id, f"type={order_type};plan={plan_key};channel={context.user_data.get('channel_code') or '-'}")
         selected_path = "usdt" if payment_method == "usdt" else "manual_review"
@@ -1384,16 +1379,19 @@ async def show_orders_menu(update, context, status_filter=None, page=0):
 
 async def show_anomaly_whitelist_menu(update, context):
     rows = db_query("SELECT * FROM anomaly_whitelist ORDER BY created_at DESC LIMIT 20")
-    keyboard = [[InlineKeyboardButton("➕ 添加UUID", callback_data="anomaly_whitelist_add")]]
+    keyboard = [[InlineKeyboardButton("➕ 添加面板用户ID", callback_data="anomaly_whitelist_add")]]
     for row in rows:
         item = dict(row)
-        short = item['user_uuid'][:10]
-        keyboard.append([InlineKeyboardButton(f"❌ 删除 {short}...", callback_data=f"anomaly_whitelist_del_{item['user_uuid']}")])
+        label = str(item['user_id']) if item['user_id'] is not None else f"旧UUID {item['user_uuid'][:8]}（待迁移）"
+        keyboard.append([InlineKeyboardButton(f"❌ 删除 {label}", callback_data=f"anomaly_whitelist_del_{item['id']}")])
     keyboard.append([InlineKeyboardButton("🔙 返回", callback_data="admin_anomaly_menu")])
     await send_or_edit_menu(update, context, "📋 **异常检测白名单**", InlineKeyboardMarkup(keyboard))
 
 async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("无管理员权限", show_alert=True)
+        return
     await query.answer()
     data = query.data
 
@@ -1430,7 +1428,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data == "admin_panel_config":
         context.user_data.pop('panelcfg_prompt_message_id', None)
-        masked = PANEL_TOKEN[:6] + "***" if PANEL_TOKEN else "未配置"
+        masked = "已配置" if PANEL_TOKEN else "未配置"
         msg = (
             "🔌 **面板对接配置**\n"
             f"面板地址: `{PANEL_URL or '未配置'}`\n"
@@ -1467,6 +1465,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "panelcfg_toggle_tls":
         new_val = not PANEL_VERIFY_TLS
         save_runtime_config(panel_verify_tls=new_val)
+        schedule_panel_warmup(context)
         append_ops_timeline('配置', '切换TLS校验', f'panel_verify_tls={new_val}', actor=query.from_user.id)
         await query.answer(f"已切换为 {new_val}", show_alert=True)
         await send_or_edit_menu(update, context, "✅ TLS 配置已更新。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
@@ -1535,9 +1534,9 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "请输入以下任一格式：\n"
             "- `tg:123456789`（按 Telegram ID）\n"
             "- `username:alice`（按用户名）\n"
-            "- `uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`\n"
+            "- `id:123`（面板数值用户 ID）\n"
             "- `short:abcd1234`（短 UUID）\n"
-            "- 或直接输入纯数字（自动按 Telegram ID）。"
+            "- `bind:TG_ID:PANEL_ID:本地订阅记录ID`（多条旧记录时精确绑定）。"
         )
         kb = [[InlineKeyboardButton("🔙 取消", callback_data="back_home")]]
         await send_or_edit_menu(update, context, tip, InlineKeyboardMarkup(kb))
@@ -1547,19 +1546,31 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if len(parts) < 5:
             await query.answer("参数错误", show_alert=True)
             return
-        _, _, _, tg_text, panel_uuid = parts
+        _, _, _, tg_text, panel_user_id_text = parts
         try:
             target_tg_id = int(tg_text)
+            panel_user_id = int(panel_user_id_text)
         except ValueError:
-            await query.answer("TG ID 格式错误", show_alert=True)
+            await query.answer("用户 ID 格式错误", show_alert=True)
             return
-        exists = db_query("SELECT 1 FROM subscriptions WHERE tg_id=? AND uuid=? LIMIT 1", (target_tg_id, panel_uuid), one=True)
-        if not exists:
-            db_execute("INSERT INTO subscriptions (tg_id, uuid, created_at) VALUES (?, ?, ?)", (target_tg_id, panel_uuid, int(time.time())))
+        panel_user = await get_panel_user(panel_user_id)
+        if not panel_user or panel_user.get('telegramId') != target_tg_id:
+            await query.answer("面板用户的 Telegram ID 不匹配，未绑定", show_alert=True)
+            return
+        pending = db_query(
+            "SELECT id FROM subscriptions WHERE tg_id=? AND user_id IS NULL ORDER BY id", (target_tg_id,)
+        )
+        if len(pending) > 1:
+            await query.answer("存在多条旧订阅，请用 bind:TG_ID:PANEL_ID:本地记录ID 精确绑定", show_alert=True)
+            return
+        if pending:
+            bind_legacy_subscription(DB_FILE, pending[0]['id'], panel_user_id, target_tg_id)
+        else:
+            ensure_local_subscription_sync(target_tg_id, panel_user)
         await send_or_edit_menu(
             update,
             context,
-            f"✅ 绑定完成\nTG ID: `{target_tg_id}`\nUUID: `{panel_uuid}`",
+            f"✅ 绑定完成\nTG ID: `{target_tg_id}`\n面板用户ID: `{panel_user_id}`",
             InlineKeyboardMarkup([[InlineKeyboardButton("🔎 继续检索", callback_data="admin_panel_user_lookup")], [InlineKeyboardButton("🏠 返回主页", callback_data="back_home")]]),
         )
         return
@@ -1710,11 +1721,10 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"{preview}\n"
             "```\n\n"
             f"最近回滚点：`{latest_text}`\n"
-            "可使用模板快速应用，或直接发送 JSON 更新。"
+            "仅可提交 Remnawave 3.4.4 契约定义的字段。"
         )
         kb = [
             [InlineKeyboardButton("✍️ 修改订阅设置(JSON)", callback_data="admin_subscription_settings_edit")],
-            [InlineKeyboardButton("🧩 应用安全模板", callback_data="admin_subsettings_tpl_safe"), InlineKeyboardButton("🧩 应用兼容模板", callback_data="admin_subsettings_tpl_compat")],
             [InlineKeyboardButton("💾 保存回滚点", callback_data="admin_subsettings_snapshot"), InlineKeyboardButton("↩️ 回滚最近一次", callback_data="admin_subsettings_rollback")],
             [InlineKeyboardButton("🔙 返回", callback_data="back_home")],
         ]
@@ -1727,27 +1737,16 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("✅ 已保存回滚点", show_alert=True)
         await send_or_edit_menu(update, context, "✅ 已保存当前订阅设置为回滚点。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_subscription_settings")]]))
         return
-    if data in {"admin_subsettings_tpl_safe", "admin_subsettings_tpl_compat"}:
-        current = await get_subscription_settings()
-        push_subscription_settings_snapshot(current, source='模板应用前自动备份')
-        payload = {'allowInsecure': False} if data.endswith('safe') else {'allowInsecure': True}
-        resp = await patch_subscription_settings(payload)
-        if resp and resp.status_code in (200, 204):
-            tpl = '安全模板' if data.endswith('safe') else '兼容模板'
-            append_ops_timeline('配置', f'应用{tpl}', f'payload={json.dumps(payload, ensure_ascii=False)}', actor=query.from_user.id)
-            await query.answer("✅ 模板应用成功", show_alert=True)
-            await send_or_edit_menu(update, context, f"✅ 已应用{tpl}。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_subscription_settings")]]))
-        else:
-            await query.answer("❌ 模板应用失败", show_alert=True)
-        return
     if data == "admin_subsettings_rollback":
-        snap = pop_subscription_settings_snapshot()
+        history = get_json_setting('subscription_settings_history', [])
+        snap = history[-1] if history else None
         if not snap:
             await query.answer("⚠️ 暂无可回滚快照", show_alert=True)
             return
-        payload = snap.get('payload') or {}
+        payload = subscription_settings_patch_from_current(snap.get('payload'))
         resp = await patch_subscription_settings(payload)
-        if resp and resp.status_code in (200, 204):
+        if resp and resp.status_code == 200:
+            pop_subscription_settings_snapshot()
             append_ops_timeline('配置', '订阅设置回滚', f"来源={snap.get('source', '-')}", actor=query.from_user.id)
             await query.answer("✅ 回滚成功", show_alert=True)
             await send_or_edit_menu(update, context, "✅ 已按最近回滚点恢复设置。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_subscription_settings")]]))
@@ -1756,7 +1755,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data == "admin_subscription_settings_edit":
         context.user_data['edit_subscription_settings'] = True
-        await send_or_edit_menu(update, context, "✍️ 请发送要 PATCH 的 JSON 内容（例如 {\"allowInsecure\":false}）", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="cancel_op")]]))
+        await send_or_edit_menu(update, context, "✍️ 请发送含 uuid 与正式字段的 PATCH JSON（如 randomizeHosts）。", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="cancel_op")]]))
         return
     if data == "admin_squads_menu":
         squads = await get_internal_squads()
@@ -1782,15 +1781,15 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             move_n = max(1, min(int(cnt_text), 20))
         except ValueError:
             move_n = 5
-        rows = db_query("SELECT uuid FROM subscriptions ORDER BY id DESC LIMIT 120")
-        pool = [dict(r)['uuid'] for r in rows]
+        rows = db_query("SELECT user_id FROM subscriptions WHERE user_id IS NOT NULL ORDER BY id DESC LIMIT 120")
+        pool = [dict(r)['user_id'] for r in rows]
         infos = await asyncio.gather(*[get_panel_user(u) for u in pool])
         candidates = []
         for uid, info in zip(pool, infos):
             if not isinstance(info, dict):
                 continue
-            squad = info.get('externalSquadUuid')
-            if squad == from_squad:
+            squad_ids = {item['uuid'] for item in info['activeInternalSquads']}
+            if from_squad in squad_ids:
                 candidates.append(uid)
             if len(candidates) >= move_n:
                 break
@@ -1798,7 +1797,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.answer("暂无可迁移候选用户", show_alert=True)
             return
         resp = await bulk_move_users_to_squad(candidates, to_squad)
-        if resp and resp.status_code in (200, 201, 204):
+        if resp.status_code == 204:
             append_ops_timeline('分组', '执行迁移建议', f'from={from_squad},to={to_squad},count={len(candidates)}', actor=query.from_user.id)
             await query.answer(f"✅ 已迁移 {len(candidates)} 人", show_alert=True)
         else:
@@ -1806,7 +1805,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data == "admin_squad_bulk_move":
         context.user_data['squad_bulk_move'] = True
-        await send_or_edit_menu(update, context, "✍️ 请按以下格式发送：\n第一行：目标分组UUID\n后续行：用户UUID列表", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_squads_menu")]]))
+        await send_or_edit_menu(update, context, "✍️ 请按以下格式发送：\n第一行：目标内部组 UUID\n后续行：面板数值用户 ID 列表", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_squads_menu")]]))
         return
     if data.startswith("admin_squad_"):
         squad_uuid = data.replace("admin_squad_", "")
@@ -1826,26 +1825,20 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append("- 暂无可访问节点")
         else:
             for n in nodes[:20]:
-                node_name = (
-                    n.get('name')
-                    or n.get('nodeName')
-                    or n.get('remark')
-                    or n.get('uuid')
-                    or '未知节点'
-                )
+                node_name = n['nodeName']
                 lines.append(f"- {node_name}")
         kb = [[InlineKeyboardButton("🔙 返回分组", callback_data="admin_squads_menu")]]
         await send_or_edit_menu(update, context, "\n".join(lines), InlineKeyboardMarkup(kb))
         return
     if data == "admin_bandwidth_dashboard":
-        nodes_rt = await get_bandwidth_nodes_realtime()
+        nodes_rt = await get_bandwidth_nodes_usage()
         top = []
         for it in nodes_rt[:5]:
-            name = it.get('name') or it.get('nodeName') or '未知节点'
-            val = it.get('totalTrafficBytes') or it.get('trafficBytes') or 0
+            name = it['name']
+            val = it['total']
             top.append((name, int(val) if isinstance(val, (int, float)) else 0))
         top.sort(key=lambda x: x[1], reverse=True)
-        lines = ["📈 **带宽看板（实时）**", "TOP节点："]
+        lines = ["📈 **带宽看板（近 7 日）**", "TOP节点："]
         if not top:
             lines.append("- 暂无数据")
         for name, val in top:
@@ -1856,14 +1849,6 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append("- 暂无")
         for tg_id, uid, used in top_users:
             lines.append(f"- 用户`{tg_id}` / `{uid[:8]}`: {round(used / 1024**3, 2)} GB")
-        alerts = detect_bandwidth_volatility(nodes_rt)
-        lines.append("\n节点波动提醒：")
-        if not alerts:
-            lines.append("- 暂无明显波动")
-        else:
-            for name, delta, ratio in alerts[:5]:
-                symbol = '⬆️' if delta > 0 else '⬇️'
-                lines.append(f"- {symbol} {name}: {round(delta / 1024**3, 2)} GB ({round(ratio*100, 1)}%)")
         stats = await get_subscription_history_stats()
         hourly = stats.get('hourlyRequestStats') if isinstance(stats, dict) else []
         recent = int(hourly[-1].get('requestCount', 0)) if hourly else 0
@@ -1935,7 +1920,8 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for r in rows:
             it = dict(r)
             ts = datetime.datetime.fromtimestamp(int(it['created_at'])).strftime('%m-%d %H:%M')
-            lines.append(f"- {ts} | {it['risk_level']} | {it['user_uuid'][:8]} | 分数{it['risk_score']} | 动作:{it['action_taken']}")
+            user_label = str(it['user_id']) if it['user_id'] is not None else f"旧 {it['user_uuid'][:8]}"
+            lines.append(f"- {ts} | {it['risk_level']} | {user_label} | 分数{it['risk_score']} | 动作:{it['action_taken']}")
         await send_or_edit_menu(update, context, "\n".join(lines), InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
         return
     if data == "admin_ops_timeline":
@@ -1945,10 +1931,11 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for r in order_logs:
             it = dict(r)
             events.append((int(it['created_at']), f"订单 | {it['action']} | {it['order_id']} | {it.get('detail') or '-'}"))
-        risk_logs = db_query("SELECT user_uuid, risk_level, risk_score, action_taken, created_at FROM anomaly_events ORDER BY created_at DESC LIMIT 15")
+        risk_logs = db_query("SELECT user_uuid, user_id, risk_level, risk_score, action_taken, created_at FROM anomaly_events ORDER BY created_at DESC LIMIT 15")
         for r in risk_logs:
             it = dict(r)
-            events.append((int(it['created_at']), f"风控 | {it['risk_level']} | {it['user_uuid'][:8]} | {it['action_taken']}"))
+            user_label = str(it['user_id']) if it['user_id'] is not None else f"旧 {it['user_uuid'][:8]}"
+            events.append((int(it['created_at']), f"风控 | {it['risk_level']} | {user_label} | {it['action_taken']}"))
         for item in get_json_setting('ops_timeline', [])[-20:]:
             events.append((int(item.get('ts', 0)), f"{item.get('type','系统')} | {item.get('title','-')} | {item.get('detail','-')}"))
         events.sort(key=lambda x: x[0], reverse=True)
@@ -1980,17 +1967,17 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data in {"bulk_reset", "bulk_disable", "bulk_delete"}:
         context.user_data['bulk_action'] = data.replace('bulk_', '')
-        tip = "每行一个UUID，或使用空格/逗号分隔。"
-        await send_or_edit_menu(update, context, f"✍️ 请输入用户UUID列表\n{tip}", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_bulk_menu")]]))
+        tip = "每行一个面板数值用户 ID，或使用空格/逗号分隔。"
+        await send_or_edit_menu(update, context, f"✍️ 请输入面板用户 ID 列表\n{tip}", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_bulk_menu")]]))
         return
     if data == "bulk_expire":
         context.user_data['bulk_action'] = 'expire'
-        tip = "第一行输入天数（例如 30），从第二行开始输入UUID列表。"
+        tip = "第一行输入天数（例如 30），从第二行开始输入面板用户 ID 列表。"
         await send_or_edit_menu(update, context, f"✍️ 批量改到期日\n{tip}", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_bulk_menu")]]))
         return
     if data == "bulk_traffic":
         context.user_data['bulk_action'] = 'traffic'
-        tip = "第一行输入流量GB（例如 200），从第二行开始输入UUID列表。"
+        tip = "第一行输入流量GB（例如 200），从第二行开始输入面板用户 ID 列表。"
         await send_or_edit_menu(update, context, f"✍️ 批量改流量包\n{tip}", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_bulk_menu")]]))
         return
     if data == "admin_orders_menu":
@@ -2028,20 +2015,20 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if data == "anomaly_whitelist_add":
         context.user_data['add_anomaly_whitelist'] = True
-        await send_or_edit_menu(update, context, "✍️ 请输入要加入白名单的用户 UUID", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="anomaly_whitelist_menu")]]))
+        await send_or_edit_menu(update, context, "✍️ 请输入要加入白名单的面板数值用户 ID", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="anomaly_whitelist_menu")]]))
         return
     if data.startswith("anomaly_whitelist_del_"):
-        uuid_val = data.replace("anomaly_whitelist_del_", "")
-        db_execute("DELETE FROM anomaly_whitelist WHERE user_uuid = ?", (uuid_val,))
+        row_id = int(data.replace("anomaly_whitelist_del_", ""))
+        db_execute("DELETE FROM anomaly_whitelist WHERE id = ?", (row_id,))
         await show_anomaly_whitelist_menu(update, context)
         return
     if data.startswith("anomaly_quick_whitelist_"):
-        uid = data.replace("anomaly_quick_whitelist_", "")
-        db_execute("INSERT OR IGNORE INTO anomaly_whitelist (user_uuid, created_at) VALUES (?, ?)", (uid, int(time.time())))
+        uid = int(data.replace("anomaly_quick_whitelist_", ""))
+        db_execute("INSERT OR IGNORE INTO anomaly_whitelist (user_id, created_at) VALUES (?, ?)", (uid, int(time.time())))
         await query.answer("✅ 已加入白名单", show_alert=False)
         return
     if data.startswith("anomaly_quick_enable_"):
-        uid = data.replace("anomaly_quick_enable_", "")
+        uid = int(data.replace("anomaly_quick_enable_", ""))
         await enable_panel_user(uid)
         await query.answer("✅ 已尝试解封该用户", show_alert=False)
         return
@@ -2084,80 +2071,45 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard = []
         for s in subs:
             s_dict = dict(s)
-            short_uuid = s_dict['uuid'][:8]
-            keyboard.append([InlineKeyboardButton(f"UUID: {short_uuid}...", callback_data=f"manage_user_{s_dict['uuid']}")])
+            if s_dict['user_id'] is None:
+                keyboard.append([InlineKeyboardButton(f"⚠️ 本地记录 #{s_dict['id']} 待迁移", callback_data="admin_panel_user_lookup")])
+            else:
+                keyboard.append([InlineKeyboardButton(f"面板ID: {s_dict['user_id']}（本地 #{s_dict['id']}）", callback_data=f"manage_user_{s_dict['user_id']}")])
         keyboard.append([InlineKeyboardButton("🔙 返回列表", callback_data="admin_users_list")])
         await send_or_edit_menu(update, context, f"👤 用户 `{target_uid}` 的订阅列表：", InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("manage_user_"):
-        target_uuid = data.replace("manage_user_", "")
-        sub = db_query("SELECT * FROM subscriptions WHERE uuid = ?", (target_uuid,), one=True)
+        target_user_id = int(data.replace("manage_user_", ""))
+        sub = db_query("SELECT * FROM subscriptions WHERE user_id = ?", (target_user_id,), one=True)
         if not sub:
             await send_or_edit_menu(update, context, "⚠️ 记录不存在", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_users_list")]]))
             return
-        panel_info = await get_panel_user(target_uuid)
+        panel_info = await get_panel_user(target_user_id)
         status = "🟢 面板正常" if panel_info else "🔴 面板已删"
-        user_nodes, user_nodes_err = [], None
-        if PANEL_URL and PANEL_TOKEN:
-            resp = await safe_api_request('GET', f"/users/{target_uuid}/accessible-nodes")
-            if not resp:
-                user_nodes_err = "network_error"
-            elif resp.status_code == 401:
-                user_nodes_err = "auth_unauthorized"
-            elif resp.status_code == 403:
-                user_nodes_err = "auth_forbidden"
-            elif resp.status_code == 404:
-                user_nodes_err = "endpoint_or_user_not_found"
-            elif resp.status_code == 200:
-                payload = extract_payload(resp)
-                if isinstance(payload, list):
-                    user_nodes = payload
-                elif isinstance(payload, dict):
-                    nodes = payload.get('accessibleNodes')
-                    if isinstance(nodes, list):
-                        user_nodes = nodes
-                    else:
-                        user_nodes_err = "empty_payload"
-                else:
-                    user_nodes_err = "empty_payload"
-            else:
-                user_nodes_err = f"http_{resp.status_code}"
-        else:
-            user_nodes_err = "config_missing"
+        user_nodes = await get_user_accessible_nodes(target_user_id)
         node_lines = ["可访问节点："]
         if user_nodes:
             for n in user_nodes[:10]:
-                node_name = n.get('name') or n.get('nodeName') or n.get('remark') or n.get('uuid') or '未知节点'
+                node_name = n['nodeName']
                 node_lines.append(f"- {node_name}")
         else:
-            reason_map = {
-                "config_missing": "面板地址或 Token 未配置",
-                "network_error": "面板网络不可达",
-                "auth_unauthorized": "Token 鉴权失败(401)",
-                "auth_forbidden": "Token 权限不足(403)",
-                "endpoint_or_user_not_found": "接口或用户不存在(404)",
-                "empty_payload": "接口返回为空",
-            }
-            node_lines.append(f"- ⚠️ {reason_map.get(user_nodes_err, user_nodes_err or '暂无')}")
-        msg = (f"👤 **用户详情**\nTG ID: `{dict(sub)['tg_id']}`\n状态: {status}\nUUID: `{target_uuid}`\n\n" + "\n".join(node_lines))
+            node_lines.append("- 暂无可访问节点")
+        msg = (f"👤 **用户详情**\nTG ID: `{dict(sub)['tg_id']}`\n状态: {status}\n面板用户ID: `{target_user_id}`\n\n" + "\n".join(node_lines))
         keyboard = [
-            [InlineKeyboardButton("🔄 重置流量", callback_data=f"reset_traffic_{target_uuid}")],
-            [InlineKeyboardButton("📜 最近请求记录", callback_data=f"user_reqhist_{target_uuid}")],
-            [InlineKeyboardButton("🗑 确认删除用户", callback_data=f"confirm_del_user_{target_uuid}")],
+            [InlineKeyboardButton("🔄 重置流量", callback_data=f"reset_traffic_{target_user_id}")],
+            [InlineKeyboardButton("📜 最近请求记录", callback_data=f"user_reqhist_{target_user_id}")],
+            [InlineKeyboardButton("🗑 确认删除用户", callback_data=f"confirm_del_user_{target_user_id}")],
             [InlineKeyboardButton("🔙 返回列表", callback_data=f"list_user_subs_{dict(sub)['tg_id']}")],
         ]
         await send_or_edit_menu(update, context, msg, InlineKeyboardMarkup(keyboard))
     elif data.startswith("user_reqhist_"):
-        target_uuid = data.replace("user_reqhist_", "")
-        sub = db_query("SELECT * FROM subscriptions WHERE uuid = ?", (target_uuid,), one=True)
-        history = await get_user_subscription_history(target_uuid)
-        records = history.get('records') if isinstance(history, dict) else None
-        total = history.get('total') if isinstance(history, dict) else None
-        if not isinstance(records, list):
-            records = []
-        lines = [f"📜 **请求记录（最近{len(records)}条）**", f"UUID: `{target_uuid}`"]
-        if isinstance(total, int):
-            lines.append(f"总记录数: `{total}`")
+        target_user_id = int(data.replace("user_reqhist_", ""))
+        sub = db_query("SELECT * FROM subscriptions WHERE user_id = ?", (target_user_id,), one=True)
+        history = await get_user_subscription_history(target_user_id)
+        records = history['records']
+        total = history['total']
+        lines = [f"📜 **请求记录（最近{len(records)}条）**", f"面板用户ID: `{target_user_id}`"]
+        lines.append(f"总记录数: `{total}`")
         lines.append("")
         if not records:
             lines.append("暂无请求记录")
@@ -2168,18 +2120,21 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 ua = (rec.get('userAgent') or '未知UA')[:40]
                 lines.append(f"• `{req_at}` | `{req_ip}` | `{ua}`")
         back_tg = dict(sub)['tg_id'] if sub else ADMIN_ID
-        kb = [[InlineKeyboardButton("🔙 返回用户", callback_data=f"manage_user_{target_uuid}")], [InlineKeyboardButton("🔙 返回列表", callback_data=f"list_user_subs_{back_tg}")]]
+        kb = [[InlineKeyboardButton("🔙 返回用户", callback_data=f"manage_user_{target_user_id}")], [InlineKeyboardButton("🔙 返回列表", callback_data=f"list_user_subs_{back_tg}")]]
         await send_or_edit_menu(update, context, "\n".join(lines), InlineKeyboardMarkup(kb))
     elif data.startswith("reset_traffic_"):
-        target_uuid = data.replace("reset_traffic_", "")
-        resp = await reset_panel_user_traffic(target_uuid)
-        if resp and resp.status_code == 204: await query.answer("✅ 流量已重置", show_alert=True)
+        target_user_id = int(data.replace("reset_traffic_", ""))
+        resp = await reset_panel_user_traffic(target_user_id)
+        if resp.status_code == 200: await query.answer("✅ 流量已重置", show_alert=True)
         else: await query.answer("❌ 操作失败", show_alert=True)
     elif data.startswith("confirm_del_user_"):
-        target_uuid = data.replace("confirm_del_user_", "")
-        await delete_panel_user(target_uuid)
-        db_execute("DELETE FROM subscriptions WHERE uuid = ?", (target_uuid,))
-        await query.answer("✅ 用户已删除", show_alert=True)
+        target_user_id = int(data.replace("confirm_del_user_", ""))
+        resp = await delete_panel_user(target_user_id)
+        if resp.status_code == 204:
+            db_execute("DELETE FROM subscriptions WHERE user_id = ?", (target_user_id,))
+            await query.answer("✅ 用户已删除", show_alert=True)
+        else:
+            await query.answer(f"❌ 面板删除失败（HTTP {resp.status_code}），本地绑定已保留", show_alert=True)
         await show_users_list(update, context)
     elif data == "admin_notify":
         try:
@@ -2308,21 +2263,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id == ADMIN_ID and context.user_data.get('panel_user_lookup_mode') and text:
         raw = text.strip()
+        pending_bind = context.user_data.pop('pending_legacy_bind', None)
+        if pending_bind:
+            if raw != '确认绑定':
+                await update.message.reply_text("已取消旧订阅绑定。")
+                return
+            tg_id, panel_id, local_id = pending_bind
+            panel_user = await get_panel_user(panel_id)
+            if not panel_user or panel_user.get('telegramId') not in (None, tg_id):
+                await update.message.reply_text("❌ 面板用户校验发生变化，未绑定。")
+                return
+            try:
+                bind_legacy_subscription(DB_FILE, local_id, panel_id, tg_id)
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ 绑定失败：{exc}")
+                return
+            await update.message.reply_text(f"✅ 已绑定本地记录 #{local_id} 到面板用户 ID {panel_id}。")
+            return
         lookup_type = "auto"
         lookup_value = raw
         if ":" in raw:
             lookup_type, lookup_value = [x.strip() for x in raw.split(":", 1)]
             lookup_type = lookup_type.lower()
+        if lookup_type == "bind":
+            parts = lookup_value.split(":")
+            if len(parts) != 3 or not all(part.isdigit() for part in parts):
+                await update.message.reply_text("❌ 格式：bind:TG_ID:PANEL_ID:本地订阅记录ID")
+                return
+            tg_id, panel_id, local_id = map(int, parts)
+            panel_user = await get_panel_user(panel_id)
+            if not panel_user or panel_user.get('telegramId') not in (None, tg_id):
+                await update.message.reply_text("❌ 面板用户不存在或 Telegram ID 不匹配，未修改本地数据。")
+                return
+            if panel_user.get('telegramId') is None:
+                context.user_data['pending_legacy_bind'] = (tg_id, panel_id, local_id)
+                await update.message.reply_text(
+                    f"⚠️ 面板用户 {panel_id}（{panel_user['username']}）没有 Telegram ID。"
+                    f"请人工核对本地记录 #{local_id} 后回复“确认绑定”；其他回复将取消。"
+                )
+                return
+            try:
+                bind_legacy_subscription(DB_FILE, local_id, panel_id, tg_id)
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ 绑定失败：{exc}")
+                return
+            await update.message.reply_text(f"✅ 已绑定本地记录 #{local_id} 到面板用户 ID {panel_id}。")
+            return
         panel_user = None
         if lookup_type in {"tg", "telegram", "telegram_id", "auto"} and lookup_value.isdigit():
-            panel_user = await get_user_by_telegram_id(int(lookup_value))
+            try:
+                panel_user = await get_user_by_telegram_id(int(lookup_value))
+            except AmbiguousPanelUserError:
+                await update.message.reply_text("⚠️ 该 Telegram ID 对应多个面板用户。请使用 id:数值ID 精确检索。")
+                return
+            except PanelApiError:
+                await update.message.reply_text("⚠️ 面板查询失败，请检查连通性与权限后重试。")
+                return
             lookup_type = "telegramId"
         elif lookup_type in {"username", "user"}:
             panel_user = await get_user_by_username(lookup_value)
             lookup_type = "username"
-        elif lookup_type in {"uuid"}:
-            panel_user = await get_panel_user(lookup_value)
-            lookup_type = "uuid"
+        elif lookup_type in {"id", "user_id"} and lookup_value.isdigit():
+            panel_user = await get_panel_user(int(lookup_value))
+            lookup_type = "userId"
         elif lookup_type in {"short", "short_uuid"}:
             panel_user = await get_user_by_short_uuid(lookup_value)
             lookup_type = "shortUuid"
@@ -2340,7 +2343,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        puuid = panel_user.get('uuid') or '-'
+        panel_id = panel_user.get('id')
         puser = panel_user.get('username') or '-'
         ptg = panel_user.get('telegramId')
         pstatus = panel_user.get('status') or '-'
@@ -2348,15 +2351,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
             "✅ 检索到面板用户",
             f"检索方式: {lookup_type}",
-            f"UUID: {puuid}",
+            f"面板用户ID: {panel_id}",
             f"用户名: {puser}",
             f"Telegram ID: {ptg if ptg is not None else '-'}",
             f"状态: {pstatus}",
             f"重置策略: {pstrategy}",
         ]
         kb = [[InlineKeyboardButton("🔎 继续检索", callback_data="admin_panel_user_lookup")], [InlineKeyboardButton("🏠 返回主页", callback_data="back_home")]]
-        if puuid != '-' and isinstance(ptg, int):
-            kb.insert(0, [InlineKeyboardButton("🔗 绑定到本地订阅", callback_data=f"bind_panel_user_{ptg}_{puuid}")])
+        if isinstance(panel_id, int) and isinstance(ptg, int):
+            kb.insert(0, [InlineKeyboardButton("🔗 绑定到本地订阅", callback_data=f"bind_panel_user_{ptg}_{panel_id}")])
         await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
         return
 
@@ -2377,24 +2380,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_url') and text:
         save_runtime_config(panel_url=text.strip())
+        schedule_panel_warmup(context)
         context.user_data.pop('panelcfg_input_url', None)
         await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 面板地址已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_token') and text:
-        save_runtime_config(panel_token=text.strip())
+        managed_by_env = os.getenv('PANEL_TOKEN') not in (None, '', 'your_panel_api_token')
+        if not managed_by_env:
+            save_runtime_config(panel_token=text.strip())
+            schedule_panel_warmup(context)
         context.user_data.pop('panelcfg_input_token', None)
         await cleanup_panelcfg_prompt_message(context, user_id)
-        await update.message.reply_text("✅ 面板 Token 已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
+        try:
+            await update.message.delete()
+        except Exception:
+            logger.warning("Could not delete administrator token input message")
+        result = "⚠️ PANEL_TOKEN 由 .env 管理，请在服务器更新后重建容器。" if managed_by_env else "✅ 面板 Token 已更新"
+        await context.bot.send_message(user_id, result, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_subdomain') and text:
         save_runtime_config(sub_domain=text.strip())
+        schedule_panel_warmup(context)
         context.user_data.pop('panelcfg_input_subdomain', None)
         await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 订阅域名已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
         return
     if user_id == ADMIN_ID and context.user_data.get('panelcfg_input_group') and text:
         save_runtime_config(group_uuid=text.strip())
+        schedule_panel_warmup(context)
         context.user_data.pop('panelcfg_input_group', None)
         await cleanup_panelcfg_prompt_message(context, user_id)
         await update.message.reply_text("✅ 默认组 UUID 已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_panel_config")]]))
@@ -2408,7 +2422,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             push_subscription_settings_snapshot(current, source='手工JSON变更前自动备份')
             resp = await patch_subscription_settings(payload)
             context.user_data.pop('edit_subscription_settings', None)
-            if resp and resp.status_code in (200, 204):
+            if resp.status_code == 200:
                 append_ops_timeline('配置', '手动更新订阅设置', json.dumps(payload, ensure_ascii=False)[:180], actor=user_id)
                 await update.message.reply_text("✅ 订阅设置已更新", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_subscription_settings")]]))
             else:
@@ -2421,17 +2435,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             lines = [x.strip() for x in text.splitlines() if x.strip()]
             if len(lines) < 2:
-                raise ValueError('格式不正确，至少需要分组UUID和1个用户UUID')
+                raise ValueError('格式不正确，至少需要内部组UUID和1个面板用户ID')
             squad_uuid = lines[0]
-            uuids = parse_uuids("\n".join(lines[1:]))
-            if not uuids:
-                raise ValueError('未解析到有效用户UUID')
-            resp = await bulk_move_users_to_squad(uuids, squad_uuid)
+            user_ids = parse_user_ids("\n".join(lines[1:]))
+            if not user_ids:
+                raise ValueError('未解析到有效面板用户ID')
+            resp = await bulk_move_users_to_squad(user_ids, squad_uuid)
             context.user_data.pop('squad_bulk_move', None)
-            if resp and resp.status_code in (200, 201, 204):
-                await update.message.reply_text(f"✅ 已提交批量迁移，目标{len(uuids)}个用户", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_squads_menu")]]))
+            if resp.status_code == 204:
+                await update.message.reply_text(f"✅ 已提交批量迁移，目标{len(user_ids)}个用户", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_squads_menu")]]))
             else:
-                await update.message.reply_text("❌ 迁移失败，请检查分组UUID与用户UUID", reply_markup=cancel_kb)
+                await update.message.reply_text("❌ 迁移失败，请检查内部组UUID与面板用户ID", reply_markup=cancel_kb)
         except Exception as exc:
             await update.message.reply_text(f"❌ 迁移失败: {exc}", reply_markup=cancel_kb)
         return
@@ -2546,10 +2560,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id == ADMIN_ID and context.user_data.get('add_anomaly_whitelist') and text:
         value = text.strip()
-        if len(value) < 8:
-            await update.message.reply_text("❌ 请输入有效 UUID")
+        if not value.isdigit() or int(value) <= 0:
+            await update.message.reply_text("❌ 请输入有效的面板数值用户 ID")
             return
-        db_execute("INSERT OR IGNORE INTO anomaly_whitelist (user_uuid, created_at) VALUES (?, ?)", (value, int(time.time())))
+        db_execute("INSERT OR IGNORE INTO anomaly_whitelist (user_id, created_at) VALUES (?, ?)", (int(value), int(time.time())))
         context.user_data['add_anomaly_whitelist'] = False
         await update.message.reply_text("✅ 白名单已添加。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="anomaly_whitelist_menu")]]))
         return
@@ -2566,40 +2580,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_bulk_menu")]]),
                     )
                     return
-                uuids = pending['uuids']
+                user_ids = pending['userIds']
                 extra = pending.get('extra')
-                ok, fail = await run_bulk_action(safe_api_request, action, uuids, extra_fields=extra)
+                enqueue_bulk_job(action, user_ids, extra, user_id)
                 context.user_data.pop('bulk_action', None)
                 context.user_data.pop('bulk_pending', None)
                 await update.message.reply_text(
-                    f"✅ 批量操作完成\n成功: {ok}\n失败: {fail}",
+                    f"✅ 已加入批量任务队列，目标 {len(user_ids)} 个用户。请在任务列表查看结果。",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_bulk_menu")]]),
                 )
                 return
 
             if action in {'reset', 'disable', 'delete'}:
-                uuids = parse_uuids(text)
+                user_ids = parse_user_ids(text)
                 extra = None
                 preview = {'reset': '批量重置流量', 'disable': '批量禁用', 'delete': '批量删除'}[action]
             elif action == 'expire':
-                expire_at, uuids = parse_expire_days_and_uuids(text)
+                expire_at, user_ids = parse_expire_days_and_user_ids(text)
                 extra = {'expireAt': expire_at}
                 preview = f"批量改到期时间 -> {expire_at}"
             elif action == 'traffic':
-                traffic_bytes, uuids = parse_traffic_and_uuids(text)
+                traffic_bytes, user_ids = parse_traffic_and_user_ids(text)
                 extra = {'trafficLimitBytes': traffic_bytes}
                 preview = f"批量改流量包 -> {traffic_bytes // (1024**3)}GB"
             else:
                 await update.message.reply_text("❌ 未知操作类型", reply_markup=cancel_kb)
                 return
 
-            if not uuids:
-                await update.message.reply_text("❌ 未解析到有效UUID，请检查输入格式", reply_markup=cancel_kb)
+            if not user_ids:
+                await update.message.reply_text("❌ 未解析到有效面板用户 ID，请检查输入格式", reply_markup=cancel_kb)
                 return
 
-            context.user_data['bulk_pending'] = {'uuids': uuids, 'extra': extra}
+            context.user_data['bulk_pending'] = {'userIds': user_ids, 'extra': extra}
             await update.message.reply_text(
-                f"🧪 预检查完成\n操作: {preview}\n目标数量: {len(uuids)}\n\n如确认执行，请回复：确认执行\n回复其他任意内容将取消。",
+                f"🧪 预检查完成\n操作: {preview}\n目标数量: {len(user_ids)}\n\n如确认执行，请回复：确认执行\n回复其他任意内容将取消。",
                 reply_markup=cancel_kb,
             )
         except Exception as exc:
@@ -2661,12 +2675,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("无管理员权限", show_alert=True)
+        return
     await query.answer()
     context.user_data['add_plan_step'] = 'name'
     await query.edit_message_text("📝 **步骤 1/6：开始添加套餐**\n\n请输入套餐名称:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]]), parse_mode='Markdown')
 
 async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("无管理员权限", show_alert=True)
+        return
     await query.answer()
     data = query.data
     client_return_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]])
@@ -2743,8 +2763,8 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ 订单状态更新失败，请重试", reply_markup=admin_return_btn)
             return
         sid = "0"
-        if order.get('target_uuid') and order.get('target_uuid') != '0':
-            sid = get_short_id(order['target_uuid'])
+        if order.get('target_user_id'):
+            sid = get_short_id(order['target_user_id'])
         data = f"ap_{order_id}_{sid}"
 
     if not data.startswith("ap_"):
@@ -2772,12 +2792,23 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = order['tg_id']
     plan_key = order['plan_key']
     order_type = order['order_type']
-    target_uuid = order['target_uuid'] if order['target_uuid'] != '0' else get_real_uuid(short_id)
+    target_user_id = order.get('target_user_id')
+    if order_type == 'renew' and not target_user_id:
+        update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED,
+                            error_message='legacy_subscription_requires_id_migration')
+        await query.edit_message_text("⚠️ 旧订阅尚未完成数值用户 ID 迁移，请先联系管理员绑定。", reply_markup=admin_return_btn)
+        return
 
     plan = db_query("SELECT * FROM plans WHERE key = ?", (plan_key,), one=True)
     if not plan:
         update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:business_validation|plan_deleted')
         await query.edit_message_text("❌ 套餐已删除", reply_markup=admin_return_btn)
+        return
+
+    if not panel_config_ready() or (order_type == 'new' and not TARGET_GROUP_UUID):
+        update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED,
+                            error_message='panel_configuration_incomplete')
+        await query.edit_message_text("⚠️ 面板地址、Token 或新购所需默认内部组尚未配置。", reply_markup=admin_return_btn)
         return
 
     await query.edit_message_text("🔄 处理中...")
@@ -2789,49 +2820,50 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if order_type == 'renew':
-            if not target_uuid:
+            if not target_user_id:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:business_validation|missing_target_uuid')
                 await query.edit_message_text("⚠️ 订单数据已过期", reply_markup=admin_return_btn)
                 return
-            user_info = await get_panel_user(target_uuid)
+            user_info = await get_panel_user(target_user_id)
             if not user_info:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='user_not_found')
                 await query.edit_message_text("⚠️ 用户不存在", reply_markup=admin_return_btn)
                 return
-            current_expire_str = user_info.get('expireAt', '').split('.')[0].replace('Z', '')
-            now = datetime.datetime.utcnow()
             try:
-                current_expire = datetime.datetime.strptime(current_expire_str, "%Y-%m-%dT%H:%M:%S")
-            except ValueError:
-                current_expire = now
+                current_expire = datetime.datetime.fromisoformat(
+                    user_info['expireAt'].replace('Z', '+00:00')
+                )
+            except (KeyError, AttributeError, ValueError) as exc:
+                raise PanelContractError("Panel user has invalid expireAt") from exc
+            now = datetime.datetime.now(datetime.timezone.utc)
             new_expire = (current_expire + datetime.timedelta(days=add_days)) if current_expire > now else (now + datetime.timedelta(days=add_days))
             expire_iso = new_expire.strftime("%Y-%m-%dT%H:%M:%SZ")
-            new_limit = user_info.get('trafficLimitBytes', 0)
+            new_limit = user_info['trafficLimitBytes']
             if reset_strategy == 'NO_RESET':
                 new_limit += add_traffic
             update_payload = {
-                "uuid": target_uuid,
+                "id": target_user_id,
                 "trafficLimitBytes": new_limit,
                 "expireAt": expire_iso,
                 "status": USER_STATUS_ACTIVE,
                 "telegramId": int(uid),
-                "activeInternalSquads": [TARGET_GROUP_UUID],
                 "trafficLimitStrategy": reset_strategy,
             }
-            await enable_panel_user(target_uuid)
+            if TARGET_GROUP_UUID:
+                update_payload["activeInternalSquads"] = [TARGET_GROUP_UUID]
             r = await patch_panel_user(update_payload)
-            if r and r.status_code in [200, 204]:
-                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_uuid=target_uuid)
+            if r.status_code == 200:
+                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_user_id=target_user_id)
                 append_order_audit_log(db_execute, order_id, 'deliver_success', query.from_user.id, 'renew')
-                await sync_user_metadata(target_uuid, uid, plan_key=plan_key, order_id=order_id)
+                await sync_user_metadata(target_user_id, uid, plan_key=plan_key, order_id=order_id)
                 await query.edit_message_text(f"✅ 续费成功\n用户: {uid}", reply_markup=admin_return_btn)
-                sub_url = user_info.get('subscriptionUrl', '')
+                sub_url = user_info['subscriptionUrl']
                 display_expire = format_time(expire_iso)
                 display_traffic = round(new_limit / 1024**3, 2)
                 msg = (
-                    f"🎉 *续费成功\!*\n\n"
+                    f"🎉 *续费成功\\!*\n\n"
                     f"⏳ 新到期时间: `{escape_markdown_v2(display_expire)}`\n"
-                    f"📡 当前总流量: `{escape_markdown_v2(str(display_traffic))} GB \({escape_markdown_v2(strategy_label)}\)`\n\n"
+                    f"📡 当前总流量: `{escape_markdown_v2(str(display_traffic))} GB \\({escape_markdown_v2(strategy_label)}\\)`\n\n"
                     f"🔗 订阅链接:\n`{escape_markdown_v2(sub_url)}`"
                 )
                 await clean_user_waiting_msg(order)
@@ -2844,37 +2876,44 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:network|panel_api_error_renew')
                 await query.edit_message_text("❌ API报错", reply_markup=admin_return_btn)
         else:
-            new_expire = datetime.datetime.utcnow() + datetime.timedelta(days=add_days)
+            new_expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=add_days)
             expire_iso = new_expire.strftime("%Y-%m-%dT%H:%M:%SZ")
+            username = f"tg_{uid}_{order_id}"
+            existing_panel_user = await get_user_by_username(username)
+            if existing_panel_user and existing_panel_user.get('telegramId') != int(uid):
+                raise PanelApiError("Order username is already assigned to another Telegram user")
             payload = {
-                "username": f"tg_{uid}_{int(time.time())}",
+                "username": username,
                 "status": USER_STATUS_ACTIVE,
                 "telegramId": int(uid),
                 "trafficLimitBytes": add_traffic,
                 "trafficLimitStrategy": reset_strategy,
                 "expireAt": expire_iso,
-                "proxies": {},
                 "activeInternalSquads": [TARGET_GROUP_UUID],
             }
-            r = await create_panel_user(payload)
-            if r and r.status_code in [200, 201]:
-                resp_data = extract_payload(r)
-                user_uuid = resp_data.get('uuid')
-                db_execute(
-                    "INSERT INTO subscriptions (tg_id, uuid, created_at, plan_key) VALUES (?, ?, ?, ?)",
-                    (uid, user_uuid, int(time.time()), plan_key),
-                )
-                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_uuid=user_uuid)
+            r = None if existing_panel_user else await create_panel_user(payload)
+            if existing_panel_user or (r and r.status_code == 201):
+                resp_data = existing_panel_user or extract_payload(r)
+                panel_user_id = resp_data.get('id')
+                if not isinstance(panel_user_id, int) or panel_user_id <= 0:
+                    raise PanelApiError("Create user response is missing numeric id")
+                linked = db_query("SELECT id FROM subscriptions WHERE user_id=?", (panel_user_id,), one=True)
+                if not linked:
+                    db_execute(
+                        "INSERT INTO subscriptions (tg_id, user_id, migration_status, created_at, plan_key) VALUES (?, ?, 'resolved', ?, ?)",
+                        (uid, panel_user_id, int(time.time()), plan_key),
+                    )
+                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_user_id=panel_user_id)
                 append_order_audit_log(db_execute, order_id, 'deliver_success', query.from_user.id, 'new')
-                await sync_user_metadata(user_uuid, uid, plan_key=plan_key, order_id=order_id)
+                await sync_user_metadata(panel_user_id, uid, plan_key=plan_key, order_id=order_id)
                 await query.edit_message_text(f"✅ 开通成功\n用户: {uid}", reply_markup=admin_return_btn)
-                sub_url = resp_data.get('subscriptionUrl', '')
+                sub_url = resp_data['subscriptionUrl']
                 display_expire = format_time(expire_iso)
                 msg = (
-                    f"🎉 *订阅开通成功\!*\n\n"
+                    f"🎉 *订阅开通成功\\!*\n\n"
                     f"📦 套餐: {escape_markdown_v2(plan_dict['name'])}\n"
                     f"⏳ 到期时间: `{escape_markdown_v2(display_expire)}`\n"
-                    f"📡 包含流量: `{escape_markdown_v2(str(plan_dict['gb']))} GB \({escape_markdown_v2(strategy_label)}\)`\n\n"
+                    f"📡 包含流量: `{escape_markdown_v2(str(plan_dict['gb']))} GB \\({escape_markdown_v2(strategy_label)}\\)`\n\n"
                     f"🔗 订阅链接:\n`{escape_markdown_v2(sub_url)}`"
                 )
                 await clean_user_waiting_msg(order)
@@ -2895,22 +2934,98 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ 错误: {exc}", reply_markup=admin_return_btn)
 
 async def process_bulk_jobs_job(context: ContextTypes.DEFAULT_TYPE):
+    rows = db_query(
+        "SELECT * FROM bulk_jobs WHERE status IN ('pending','retry') AND next_attempt_at<=? ORDER BY created_at ASC LIMIT 1",
+        (int(time.time()),),
+    )
+    if not rows:
+        return
+    job = dict(rows[0])
     try:
-        rows = db_query("SELECT * FROM bulk_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1")
-        if not rows:
-            return
-        job = dict(rows[0])
-        db_execute("UPDATE bulk_jobs SET status='running', updated_at=? WHERE id=?", (int(time.time()), job['id']))
-        payload = json.loads(job.get('payload_json') or '{}')
-        uuids = payload.get('uuids') or []
-        extra = payload.get('extra') or {}
-        ok, fail = await run_bulk_action(safe_api_request, job['action'], uuids, extra_fields=extra)
-        result = {'ok': ok, 'fail': fail}
-        status = 'done' if fail == 0 else 'partial'
-        db_execute("UPDATE bulk_jobs SET status=?, result_json=?, updated_at=? WHERE id=?", (status, json.dumps(result, ensure_ascii=False), int(time.time()), job['id']))
-        append_ops_timeline('批量', '批量任务完成', f"job={job['id']},action={job['action']},ok={ok},fail={fail}", actor='系统')
-    except Exception as exc:
-        logger.exception('process_bulk_jobs_job failed: %s', exc)
+        payload = json.loads(job['payload_json'])
+    except (ValueError, TypeError):
+        db_execute(
+            "UPDATE bulk_jobs SET status='failed', result_json=?, updated_at=? WHERE id=?",
+            (json.dumps({'reason': 'invalid_payload_json'}), int(time.time()), job['id']),
+        )
+        return
+    if not isinstance(payload, dict):
+        db_execute(
+            "UPDATE bulk_jobs SET status='failed', result_json=?, updated_at=? WHERE id=?",
+            (json.dumps({'reason': 'payload_must_be_object'}), int(time.time()), job['id']),
+        )
+        return
+    user_ids = payload.get('userIds')
+    if not isinstance(user_ids, list) or not user_ids or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in user_ids
+    ):
+        db_execute(
+            "UPDATE bulk_jobs SET status='migration_required', result_json=?, updated_at=? WHERE id=?",
+            (json.dumps({'reason': 'legacy_or_invalid_user_ids'}), int(time.time()), job['id']),
+        )
+        return
+    attempts = int(job['attempts']) + 1
+    db_execute("UPDATE bulk_jobs SET status='running', attempts=?, updated_at=? WHERE id=?",
+               (attempts, int(time.time()), job['id']))
+    try:
+        accepted, failed = await api_run_bulk_action(
+            job['action'], user_ids, payload.get('extra') or {}, PANEL_URL, get_headers(), PANEL_VERIFY_TLS
+        )
+    except PanelApiError as exc:
+        if job['action'] in {'reset', 'delete'}:
+            status = 'unknown'
+        else:
+            status = 'retry' if attempts < 3 else 'failed'
+        db_execute(
+            "UPDATE bulk_jobs SET status=?, result_json=?, next_attempt_at=?, updated_at=? WHERE id=?",
+            (status, json.dumps({'error': str(exc)}), int(time.time()) + 30 * attempts,
+             int(time.time()), job['id']),
+        )
+        logger.warning("bulk job %s %s after transport failure: %s", job['id'], status, exc)
+        return
+    except (ValueError, KeyError, TypeError) as exc:
+        db_execute(
+            "UPDATE bulk_jobs SET status='failed', result_json=?, updated_at=? WHERE id=?",
+            (json.dumps({'reason': str(exc)}), int(time.time()), job['id']),
+        )
+        return
+    result = {'accepted': accepted, 'failed': failed}
+    status = 'submitted' if failed == 0 else (
+        'unknown' if job['action'] in {'reset', 'delete'} else 'failed'
+    )
+    db_execute("UPDATE bulk_jobs SET status=?, result_json=?, updated_at=? WHERE id=?",
+               (status, json.dumps(result), int(time.time()), job['id']))
+    append_ops_timeline('批量', '批量任务已提交', f"job={job['id']},action={job['action']},accepted={accepted},failed={failed}", actor='系统')
+
+
+async def reconcile_legacy_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
+    """Resolve only one-to-one legacy links using the documented Telegram filter."""
+    if not PANEL_URL or not PANEL_TOKEN:
+        return
+    rows = db_query(
+        "SELECT id, tg_id FROM subscriptions WHERE user_id IS NULL ORDER BY tg_id, id"
+    )
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[int(row['tg_id'])].append(int(row['id']))
+    for tg_id, local_ids in grouped.items():
+        if len(local_ids) != 1:
+            db_execute(
+                "UPDATE subscriptions SET migration_status='ambiguous' WHERE tg_id=? AND user_id IS NULL",
+                (tg_id,),
+            )
+            continue
+        try:
+            users = await api_get_users_by_telegram_id(tg_id, PANEL_URL, get_headers(), PANEL_VERIFY_TLS)
+            if len(users) == 1 and users[0].get('telegramId') == tg_id:
+                bind_legacy_subscription(DB_FILE, local_ids[0], users[0]['id'], tg_id)
+            elif len(users) > 1:
+                db_execute(
+                    "UPDATE subscriptions SET migration_status='ambiguous' WHERE id=?",
+                    (local_ids[0],),
+                )
+        except (PanelApiError, ValueError) as exc:
+            logger.warning("legacy subscription %s remains pending: %s", local_ids[0], exc)
 
 async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
     try: 
@@ -2922,20 +3037,22 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
         logger.warning("failed to load expiry job settings: %s", exc)
         notify_days = 3
         cleanup_days = 7
-    subs = db_query("SELECT * FROM subscriptions")
+    subs = db_query("SELECT * FROM subscriptions WHERE user_id IS NOT NULL")
     if not subs: return
-    now = datetime.datetime.utcnow()
-    to_delete_uuids = []
-    to_disable_uuids = []
+    now = datetime.datetime.now(datetime.timezone.utc)
     sem = asyncio.Semaphore(10)
     async def check_single_sub(sub):
         async with sem:
             u_dict = dict(sub)
-            info = await get_panel_user(u_dict['uuid'])
-            if not info: return
+            panel_user_id = u_dict['user_id']
+            info = await get_panel_user(panel_user_id)
+            if not info:
+                logger.warning("Panel user %s is absent; local mapping retained for review",
+                               panel_user_id)
+                return
             try:
-                ex_str = info.get('expireAt', '').split('.')[0].replace('Z','')
-                ex_dt = datetime.datetime.strptime(ex_str, "%Y-%m-%dT%H:%M:%S")
+                ex_str = info['expireAt']
+                ex_dt = datetime.datetime.fromisoformat(ex_str.replace('Z', '+00:00'))
                 days_left = (ex_dt - now).days
                 if 0 <= days_left <= notify_days:
                     last_notify_expire = u_dict.get('last_notify_expire_at')
@@ -2944,34 +3061,36 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
                     now_ts = int(time.time())
                     can_send_by_daily_limit = should_send_expire_notice(last_notify_at, now_ts)
                     if (str(last_notify_expire or '') != ex_str or int(last_notify_days_left or -999) != days_left) and can_send_by_daily_limit:
-                        sid = get_short_id(u_dict['uuid'])
+                        sid = get_short_id(panel_user_id)
                         kb = [[InlineKeyboardButton("💳 立即续费", callback_data=f"selrenew_{sid}")]]
-                        msg = f"⚠️ **续费提醒**\n\n您的订阅 (UUID: `{u_dict['uuid'][:8]}...`) \n将在 **{days_left}** 天后到期。\n请及时续费以免服务中断。"
+                        msg = f"⚠️ **续费提醒**\n\n您的订阅 (面板用户ID: `{panel_user_id}`) \n将在 **{days_left}** 天后到期。\n请及时续费以免服务中断。"
                         try:
                             await context.bot.send_message(u_dict['tg_id'], msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
                             db_execute(
-                                "UPDATE subscriptions SET last_notify_expire_at = ?, last_notify_days_left = ?, last_notify_at = ? WHERE uuid = ?",
-                                (ex_str, days_left, int(time.time()), u_dict['uuid']),
+                                "UPDATE subscriptions SET last_notify_expire_at = ?, last_notify_days_left = ?, last_notify_at = ? WHERE id = ?",
+                                (ex_str, days_left, int(time.time()), u_dict['id']),
                             )
                         except Exception as exc:
                             logger.warning("Failed to send expiry notice to %s: %s", u_dict['tg_id'], exc)
-                if days_left == -1 and str(info.get('status', '')).lower() == 'active':
-                    to_disable_uuids.append(u_dict['uuid'])
+                if days_left < 0 and info['status'] == USER_STATUS_ACTIVE:
+                    disabled = await disable_panel_user(panel_user_id)
+                    if disabled.status_code != 200:
+                        logger.warning("Failed to disable expired Panel user %s: HTTP %s", panel_user_id, disabled.status_code)
                 if days_left < -cleanup_days:
-                    to_delete_uuids.append(u_dict['uuid'])
-                    db_execute("DELETE FROM subscriptions WHERE uuid = ?", (u_dict['uuid'],))
-                    try:
-                        await context.bot.send_message(u_dict['tg_id'], f"🗑 您的订阅因过期超过 {cleanup_days} 天已被系统回收。")
-                    except Exception as exc:
-                        logger.warning("Failed to notify cleanup to %s: %s", u_dict['tg_id'], exc)
+                    deleted = await delete_panel_user(panel_user_id)
+                    if deleted.status_code == 204:
+                        db_execute("DELETE FROM subscriptions WHERE id = ?", (u_dict['id'],))
+                        try:
+                            await context.bot.send_message(u_dict['tg_id'], f"🗑 您的订阅因过期超过 {cleanup_days} 天已被系统回收。")
+                        except Exception as exc:
+                            logger.warning("Failed to notify cleanup to %s: %s", u_dict['tg_id'], exc)
+                    else:
+                        logger.warning("Panel deletion failed for user %s: HTTP %s; local mapping retained",
+                                       panel_user_id, deleted.status_code)
             except Exception as e:
-                logger.warning("check_single_sub failed for %s: %s", u_dict.get('uuid'), e)
+                logger.warning("check_single_sub failed for %s: %s", panel_user_id, e)
     tasks = [check_single_sub(sub) for sub in subs]
     await asyncio.gather(*tasks)
-    if to_disable_uuids:
-        await apply_user_status_bulk_with_fallback(to_disable_uuids, USER_STATUS_DISABLED)
-    if to_delete_uuids:
-        await bulk_delete_panel_users(to_delete_uuids)
 
 async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2987,8 +3106,8 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     added_ts = now_ts
                 if now_ts - added_ts >= auto_hours * 3600:
-                    resp = await patch_panel_user({"uuid": uid, "status": USER_STATUS_ACTIVE})
-                    if resp and resp.status_code in (200, 201, 204):
+                    resp = await patch_panel_user({"id": int(uid), "status": USER_STATUS_ACTIVE})
+                    if resp.status_code == 200:
                         changed = True
                         candidates.pop(uid, None)
                         append_ops_timeline('风控', '自动解封', f'uid={uid},after={auto_hours}h', actor='系统', target=uid)
@@ -3003,32 +3122,19 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
 
         val_scan = db_query("SELECT value FROM settings WHERE key='anomaly_last_scan_ts'", one=True)
         last_scan_ts = int(val_scan['value']) if val_scan else 0
-        whitelist_rows = db_query("SELECT user_uuid FROM anomaly_whitelist")
-        whitelist = {dict(r)['user_uuid'] for r in whitelist_rows}
+        whitelist_rows = db_query("SELECT user_id FROM anomaly_whitelist WHERE user_id IS NOT NULL")
+        whitelist = {int(r['user_id']) for r in whitelist_rows}
 
         def _extract_log_ts(log):
-            for key in ('createdAt', 'requestAt', 'timestamp', 'time'):
-                value = log.get(key)
-                if value is None:
-                    continue
-                if isinstance(value, (int, float)):
-                    return int(value)
-                if isinstance(value, str):
-                    try:
-                        if value.isdigit():
-                            return int(value)
-                        dt = datetime.datetime.strptime(value.split('.')[0].replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-                        return int(dt.timestamp())
-                    except Exception:
-                        continue
-            return 0
+            value = log['requestAt']
+            return int(datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
 
         prepared = []
         for row in logs:
             rec = dict(row)
             ts = _extract_log_ts(rec)
             rec['_ts'] = ts
-            rec['_fmt_time'] = datetime.datetime.utcfromtimestamp(ts).strftime('%m-%d %H:%M') if ts else '-'
+            rec['_fmt_time'] = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime('%m-%d %H:%M') if ts else '-'
             prepared.append(rec)
 
         incidents, max_seen_ts = build_anomaly_incidents(prepared, last_scan_ts, whitelist, limit)
@@ -3040,9 +3146,9 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
         unfreeze_candidates = get_json_setting('risk_unfreeze_candidates', {})
         if not isinstance(unfreeze_candidates, dict):
             unfreeze_candidates = {}
-        high_risk_disable_uuids = []
-        mid_risk_limited_uuids = []
-        ip_control_enabled = capability_enabled("ip_control", default=False)
+        high_risk_disable_user_ids = []
+        mid_risk_limited_user_ids = []
+        ip_control_enabled = capability_enabled("connections_drop", default=False)
 
         for item in incidents:
             uid = item['uid']
@@ -3051,33 +3157,33 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
                 risk_level = '高'
                 if enforce_mode == 'enforce':
                     action_taken = '禁用'
-                    high_risk_disable_uuids.append(uid)
-                    unfreeze_candidates.pop(uid, None)
+                    high_risk_disable_user_ids.append(uid)
+                    unfreeze_candidates.pop(str(uid), None)
                 elif enforce_mode == 'gray':
                     action_taken = '限速(灰度)'
-                    mid_risk_limited_uuids.append(uid)
-                    unfreeze_candidates[uid] = int(time.time())
+                    mid_risk_limited_user_ids.append(uid)
+                    unfreeze_candidates[str(uid)] = int(time.time())
                 else:
                     action_taken = '仅告警(观察)'
-                    watchlist.add(uid)
+                    watchlist.add(str(uid))
             elif score >= low_score:
                 risk_level = '中'
                 if enforce_mode == 'enforce':
                     action_taken = '限速'
-                    mid_risk_limited_uuids.append(uid)
-                    unfreeze_candidates[uid] = int(time.time())
+                    mid_risk_limited_user_ids.append(uid)
+                    unfreeze_candidates[str(uid)] = int(time.time())
                 else:
                     action_taken = '仅告警(灰度/观察)'
-                    watchlist.add(uid)
+                    watchlist.add(str(uid))
             else:
                 risk_level = '低'
                 action_taken = '告警'
-                watchlist.add(uid)
+                watchlist.add(str(uid))
 
             evidence_summary = '; '.join(f"{e['ip']}@{e['ts']}" for e in item['evidence'][:3])
             db_execute(
-                "INSERT INTO anomaly_events (user_uuid, risk_level, risk_score, ip_count, ua_diversity, density, action_taken, evidence_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (uid, risk_level, score, int(item['ip_count']), int(item['ua_diversity']), int(item['density']), action_taken, evidence_summary[:400], int(time.time())),
+                "INSERT INTO anomaly_events (user_uuid, user_id, risk_level, risk_score, ip_count, ua_diversity, density, action_taken, evidence_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ('', uid, risk_level, score, int(item['ip_count']), int(item['ua_diversity']), int(item['density']), action_taken, evidence_summary[:400], int(time.time())),
             )
             append_ops_timeline('风控', '异常处置', f'uid={uid},level={risk_level},action={action_taken},score={score}', actor='系统', target=uid)
             await sync_user_metadata(uid, tg_id="-", risk_level=risk_level)
@@ -3091,15 +3197,15 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 lines = [
                     "🚨 *异常检测（可解释）*",
-                    f"风险等级: `{risk_level}` \| 处置: `{action_taken}`",
+                    f"风险等级: `{risk_level}` \\| 处置: `{action_taken}`",
                     f"用户: `{escape_markdown_v2(uid)}`",
                     f"风险评分: `{score}`",
-                    f"IP数量: `{item['ip_count']}` \| UA分散: `{item['ua_diversity']}` \| 请求密度: `{item['density']}`",
+                    f"IP数量: `{item['ip_count']}` \\| UA分散: `{item['ua_diversity']}` \\| 请求密度: `{item['density']}`",
                     "证据（最近10条）:",
                 ]
                 for ev in item['evidence'][:10]:
                     lines.append(
-                        f"- `{escape_markdown_v2(str(ev['ts']))}` \| `{escape_markdown_v2(str(ev['ip']))}` \| `{escape_markdown_v2(str(ev['ua']))}`"
+                        f"- `{escape_markdown_v2(str(ev['ts']))}` \\| `{escape_markdown_v2(str(ev['ip']))}` \\| `{escape_markdown_v2(str(ev['ua']))}`"
                     )
                 quick_kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ 加入白名单", callback_data=f"anomaly_quick_whitelist_{uid}")],
@@ -3109,10 +3215,10 @@ async def check_anomalies_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as exc:
                 logger.warning("Failed to notify anomaly admin: %s", exc)
 
-        if high_risk_disable_uuids:
-            await apply_user_status_bulk_with_fallback(high_risk_disable_uuids, USER_STATUS_DISABLED)
-        if mid_risk_limited_uuids:
-            await apply_user_status_bulk_with_fallback(mid_risk_limited_uuids, USER_STATUS_LIMITED)
+        if high_risk_disable_user_ids:
+            await apply_user_status_bulk(high_risk_disable_user_ids, USER_STATUS_DISABLED)
+        if mid_risk_limited_user_ids:
+            await apply_user_status_bulk(mid_risk_limited_user_ids, USER_STATUS_LIMITED)
 
         set_risk_watchlist(watchlist)
         set_json_setting('risk_unfreeze_candidates', unfreeze_candidates)
@@ -3166,19 +3272,19 @@ if __name__ == '__main__':
     app.add_error_handler(telegram_error_handler)
     
     app.job_queue.run_daily(check_expiry_job, time=datetime.time(hour=12, minute=0, second=0))
-    app.job_queue.run_repeating(check_anomalies_job, interval=3600, first=60, name='check_anomalies_job')
-    
+    anomaly_interval_seconds = 3600
     try:
-        val_int = db_query("SELECT value FROM settings WHERE key='anomaly_interval'", one=True)
-        if val_int:
-            interval_sec = float(val_int['value']) * 3600
-            if interval_sec > 0:
-                loop = asyncio.get_event_loop()
-                loop.create_task(reschedule_anomaly_job(app, val_int['value']))
-        if panel_config_ready():
-            asyncio.get_event_loop().create_task(warmup_panel_runtime_data())
-    except Exception as exc:
-        logger.warning("Failed to reschedule anomaly job at startup: %s", exc)
+        saved_interval = db_query("SELECT value FROM settings WHERE key='anomaly_interval'", one=True)
+        if saved_interval and float(saved_interval['value']) > 0:
+            anomaly_interval_seconds = float(saved_interval['value']) * 3600
+    except (ValueError, TypeError) as exc:
+        logger.warning("Invalid anomaly interval; using one hour: %s", exc)
+    app.job_queue.run_repeating(check_anomalies_job, interval=anomaly_interval_seconds, first=60, name='check_anomalies_job')
+    app.job_queue.run_repeating(process_bulk_jobs_job, interval=30, first=10, name='process_bulk_jobs_job')
+    app.job_queue.run_repeating(reconcile_legacy_subscriptions_job, interval=3600, first=20, name='reconcile_legacy_subscriptions_job')
+
+    if panel_config_ready():
+        app.job_queue.run_once(warmup_panel_runtime_job, when=5, name='warmup_panel_runtime_job')
 
     print(f"🚀 RemnaShop-Pro {APP_VERSION} 已启动 | 监听中...")
     app.run_polling()

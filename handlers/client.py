@@ -8,8 +8,7 @@ def build_nodes_status_message(nodes: list[dict]) -> str:
     else:
         for node in nodes:
             name = node.get('name', '未知节点')
-            status_raw = str(node.get('status', '')).lower()
-            is_online = status_raw in ['connected', 'healthy', 'online', 'active', 'true'] or node.get('isConnected') is True
+            is_online = node['isConnected']
             icon = "🟢" if is_online else "🔴"
             stat_text = "在线" if is_online else "离线"
             msg_list.append(f"{icon} **{name}** | {stat_text}")

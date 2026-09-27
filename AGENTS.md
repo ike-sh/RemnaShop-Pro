@@ -10,12 +10,22 @@ This repository must support exactly one deployment method: Docker Compose.
 - The bootstrap script is the single entrypoint for install/uninstall workflows.
 
 ## API source of truth
-Use `docs/remnawave-openapi.json` as the single source of truth for all Remnawave API integration work.
+The supported Remnawave target is Panel **3.4.4**, with official
+`@remnawave/backend-contract` **3.4.15**. Use the vendored
+`docs/remnawave-openapi.json` for all runtime API work. Its provenance and
+checksums are recorded in `docs/remnawave-contract-source.md`.
+
+The vendored specification must come from the matching official release.
+Never validate a newer Panel against an older specification. Changing the
+compatibility target requires updating the official contract, runtime client,
+inventory, and contract tests together.
 
 ## API rules
 - Do not invent endpoints.
 - Do not invent request fields, response fields, query parameters, path parameters, or callback payloads.
 - Do not guess API behavior when the OpenAPI document is unclear.
+- Do not probe guessed routes or fields as compatibility fallbacks. Supporting
+  multiple Panel versions requires an explicit, tested version capability design.
 - If the current code conflicts with `docs/remnawave-openapi.json`, update the code to match the OpenAPI document.
 - Before changing any API-related code, read the relevant parts of `docs/remnawave-openapi.json`.
 - Prefer deriving request/response shapes, validation rules, and typed models directly from the OpenAPI document.

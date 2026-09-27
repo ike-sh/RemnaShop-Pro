@@ -17,7 +17,7 @@ class TestPanelApiIpControlContract(unittest.TestCase):
                 return ast.literal_eval(node.value)
         self.fail('IP_CONTROL_ENDPOINT_SPECS not found in services/panel_api.py')
 
-    def test_ip_control_paths_are_declared_in_openapi(self):
+    def test_connection_control_paths_are_declared_in_openapi(self):
         endpoint_specs = self._load_ip_control_endpoint_specs()
         spec = json.loads(Path('docs/remnawave-openapi.json').read_text(encoding='utf-8'))
         paths = spec.get('paths', {})

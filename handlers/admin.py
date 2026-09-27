@@ -87,7 +87,7 @@ def format_order_detail(item: dict, logs: list[dict]) -> str:
         f"状态: `{order_status_label(item['status'])}`\n"
         f"类型: `{order_type_label(item['order_type'])}`\n"
         f"套餐: `{item['plan_key']}`\n"
-        f"目标UUID: `{item.get('target_uuid') or '0'}`\n"
+        f"面板用户ID: `{item.get('target_user_id') or '新购'}`\n"
         f"渠道码: `{item.get('channel_code') or '-'}`\n"
         f"失败原因: `{err}`\n"
         f"创建时间: `{created}`\n\n"

@@ -33,8 +33,8 @@ def classify_order_failure(error_text: str) -> str:
     return "unknown"
 
 
-def create_order(db_query, db_execute, tg_id, plan_key, order_type, target_uuid, menu_message_id=None, channel_code=None):
-    normalized_target_uuid = str(target_uuid or "0")
+def create_order(db_query, db_execute, tg_id, plan_key, order_type, target_user_id, menu_message_id=None, channel_code=None):
+    normalized_target_user_id = int(target_user_id or 0)
     normalized_channel_code = str(channel_code or "")
     existing = db_query(
         """SELECT * FROM orders
@@ -42,20 +42,20 @@ def create_order(db_query, db_execute, tg_id, plan_key, order_type, target_uuid,
           AND status=?
           AND plan_key=?
           AND order_type=?
-          AND target_uuid=?
+          AND COALESCE(target_user_id, 0)=?
           AND COALESCE(channel_code, '')=?
         ORDER BY created_at DESC LIMIT 1""",
-        (tg_id, STATUS_PENDING, plan_key, order_type, normalized_target_uuid, normalized_channel_code),
+        (tg_id, STATUS_PENDING, plan_key, order_type, normalized_target_user_id, normalized_channel_code),
         one=True,
     )
     if existing:
         logger.info(
-            "reusing pending order for tg_id=%s order_id=%s plan=%s type=%s target_uuid=%s channel=%s",
+            "reusing pending order for tg_id=%s order_id=%s plan=%s type=%s target_user_id=%s channel=%s",
             tg_id,
             existing["order_id"],
             plan_key,
             order_type,
-            normalized_target_uuid,
+            normalized_target_user_id,
             normalized_channel_code or "-",
         )
         return dict(existing), False
@@ -64,9 +64,9 @@ def create_order(db_query, db_execute, tg_id, plan_key, order_type, target_uuid,
     order_id = uuid.uuid4().hex[:12]
     db_execute(
         """INSERT INTO orders
-        (order_id, tg_id, plan_key, order_type, target_uuid, status, menu_message_id, channel_code, created_at, updated_at)
+        (order_id, tg_id, plan_key, order_type, target_user_id, status, menu_message_id, channel_code, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (order_id, tg_id, plan_key, order_type, normalized_target_uuid, STATUS_PENDING, menu_message_id, channel_code, now, now),
+        (order_id, tg_id, plan_key, order_type, normalized_target_user_id or None, STATUS_PENDING, menu_message_id, channel_code, now, now),
     )
     created = db_query("SELECT * FROM orders WHERE order_id=?", (order_id,), one=True)
     logger.info("created order order_id=%s tg_id=%s type=%s", order_id, tg_id, order_type)
@@ -78,12 +78,12 @@ def get_order(db_query, order_id):
     return dict(row) if row else None
 
 
-def update_order_status(db_execute, order_id, from_statuses, to_status, error_message=None, delivered_uuid=None):
+def update_order_status(db_execute, order_id, from_statuses, to_status, error_message=None, delivered_user_id=None):
     now = int(time.time())
     placeholders = ",".join(["?"] * len(from_statuses))
-    query = f"""UPDATE orders SET status=?, updated_at=?, error_message=?, delivered_uuid=?
+    query = f"""UPDATE orders SET status=?, updated_at=?, error_message=?, delivered_user_id=COALESCE(?, delivered_user_id)
     WHERE order_id=? AND status IN ({placeholders})"""
-    args = (to_status, now, error_message, delivered_uuid, order_id, *from_statuses)
+    args = (to_status, now, error_message, delivered_user_id, order_id, *from_statuses)
     changed = db_execute(query, args)
     if changed > 0:
         logger.info("order status updated order_id=%s -> %s", order_id, to_status)
