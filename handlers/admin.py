@@ -74,6 +74,7 @@ def format_order_row(item: dict) -> str:
 
 def format_order_detail(item: dict, logs: list[dict]) -> str:
     created = datetime.datetime.fromtimestamp(int(item['created_at'])).strftime('%Y-%m-%d %H:%M')
+    updated = datetime.datetime.fromtimestamp(int(item['updated_at'])).strftime('%Y-%m-%d %H:%M')
     log_lines = []
     for it in logs:
         ts = datetime.datetime.fromtimestamp(int(it['created_at'])).strftime('%m-%d %H:%M')
@@ -90,8 +91,10 @@ def format_order_detail(item: dict, logs: list[dict]) -> str:
         f"类型: `{order_type_label(item['order_type'])}`\n"
         f"套餐: `{item['plan_key']}`\n"
         f"面板用户ID: `{item.get('target_user_id') or '新购'}`\n"
+        f"发货用户ID: `{item.get('delivered_user_id') or '-'}`\n"
         f"渠道码: `{item.get('channel_code') or '-'}`\n"
         f"失败原因: `{err}`\n"
-        f"创建时间: `{created}`\n\n"
+        f"创建时间: `{created}`\n"
+        f"更新时间: `{updated}`\n\n"
         f"最近审计:\n" + ("\n".join(log_lines) if log_lines else "- 无")
     )

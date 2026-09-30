@@ -35,11 +35,13 @@ from utils.formatting import escape_markdown_v2
 from handlers.bulk_actions import parse_user_ids, parse_user_ids_strict, parse_extend_days_and_user_ids, parse_expire_days_and_user_ids, parse_traffic_and_user_ids
 from handlers.admin import format_order_detail, format_order_row, order_status_label
 from handlers.client import build_nodes_status_message
+from handlers.telegram_ui import edit_callback_message, callback_message_kind
 from handlers.v38_views import device_summary, dashboard_summary, node_metrics_summary, http_stats_summary, geocheck_summary, top_hwid_users_summary, fit_message
 from jobs.anomaly import build_anomaly_incidents
 from jobs.expiry import should_send_expire_notice
 from utils.constants import APP_VERSION, USER_STATUS_ACTIVE, USER_STATUS_LIMITED, USER_STATUS_DISABLED
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -745,33 +747,18 @@ async def build_top_users_traffic(max_users=50):
 
 
 async def send_or_edit_menu(update, context, text, reply_markup, parse_mode='Markdown'):
-    async def _safe_send(chat_id, body, markup, mode):
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=body, reply_markup=markup, parse_mode=mode)
-        except Exception as exc:
-            if mode is not None:
-                logger.warning("send_message failed with parse_mode=%s, fallback plain text: %s", mode, exc)
-                await context.bot.send_message(chat_id=chat_id, text=body, reply_markup=markup)
-            else:
-                raise
-
     if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception as exc:
-            if parse_mode is not None:
-                logger.warning("edit_message_text failed with parse_mode=%s, fallback plain text: %s", parse_mode, exc)
-                try:
-                    await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup)
-                    return
-                except Exception:
-                    pass
-            try: await update.callback_query.delete_message()
-            except Exception as exc:
-                logger.debug("delete callback message failed: %s", exc)
-            await _safe_send(update.effective_chat.id, text, reply_markup, parse_mode)
-    else:
-        await _safe_send(update.effective_chat.id, text, reply_markup, parse_mode)
+        await edit_callback_message(update.callback_query, context.bot, update.effective_chat.id,
+                                    text, reply_markup, parse_mode)
+        return
+    try:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text,
+                                       reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as exc:
+        if parse_mode is None or "can't parse entities" not in str(exc).lower():
+            raise
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text,
+                                       reply_markup=reply_markup)
 
 
 async def send_subscription_card(context, tg_id, panel_user, panel_user_id):
@@ -1073,7 +1060,8 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data == "client_nodes":
-        try: await query.edit_message_text("🔄 正在获取节点状态...")
+        try: await edit_callback_message(query, context.bot, update.effective_chat.id,
+                                         "🔄 正在获取节点状态...")
         except Exception as exc:
             logger.debug("node status loading hint message failed: %s", exc)
         nodes = await get_nodes_status()
@@ -1216,7 +1204,8 @@ async def client_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             message = "⚠️ 旧订阅正在等待管理员核对迁移，请勿重复购买。" if subs else "❌ 您名下没有订阅。\n请点击“购买新订阅”。"
             await send_or_edit_menu(update, context, message, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="back_home")]]))
             return
-        try: await query.edit_message_text("🔄 正在加载订阅列表...")
+        try: await edit_callback_message(query, context.bot, update.effective_chat.id,
+                                         "🔄 正在加载订阅列表...")
         except Exception as exc:
             logger.debug("failed to delete view_sub message: %s", exc)
         tasks = [get_panel_user(sub['user_id']) for sub in mapped_subs]
@@ -1617,6 +1606,10 @@ async def show_orders_menu(update, context, status_filter=None, page=0):
     keyboard.append([
         InlineKeyboardButton("❌ 失败", callback_data="admin_orders_status_failed"),
         InlineKeyboardButton("📋 全部", callback_data="admin_orders_menu"),
+    ])
+    keyboard.append([
+        InlineKeyboardButton("❓ 待核对", callback_data="admin_orders_status_unknown"),
+        InlineKeyboardButton("🟠 续期后续处理", callback_data="admin_orders_status_extension_applied"),
     ])
 
     nav = []
@@ -2409,8 +2402,15 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logs = db_query("SELECT * FROM order_audit_logs WHERE order_id=? ORDER BY created_at DESC LIMIT 5", (item['order_id'],))
         txt = format_order_detail(item, [dict(x) for x in logs])
         kb = [[InlineKeyboardButton("🔙 返回", callback_data="admin_orders_menu")]]
-        if item.get('status') == STATUS_FAILED:
+        if item.get('status') == STATUS_PENDING:
+            kb.insert(0, [InlineKeyboardButton("✅ 通过", callback_data=f"ap_{item['order_id']}_0"),
+                          InlineKeyboardButton("❌ 拒绝", callback_data=f"rj_{item['order_id']}")])
+        elif item.get('status') == STATUS_FAILED and safe_to_retry_order(item):
             kb.insert(0, [InlineKeyboardButton("♻️ 重试发货", callback_data=f"rt_{item['order_id']}")])
+        if item.get('status') in (STATUS_PENDING, STATUS_FAILED) and (item.get('status') == STATUS_PENDING or safe_to_retry_order(item)):
+            kb.insert(0, [InlineKeyboardButton("🚫 取消订单", callback_data=f"order_cancel_confirm_{item['order_id']}")])
+        if item.get('status') in (STATUS_APPROVED, STATUS_UNKNOWN, STATUS_EXTENSION_APPLIED, STATUS_FAILED):
+            kb.insert(0, [InlineKeyboardButton("🔎 重新核对", callback_data=f"admin_order_{item['order_id']}")])
         await send_or_edit_menu(update, context, txt, InlineKeyboardMarkup(kb))
         return
     if data == "anomaly_whitelist_menu":
@@ -3120,7 +3120,24 @@ async def add_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     context.user_data['add_plan_step'] = 'name'
-    await query.edit_message_text("📝 **步骤 1/6：开始添加套餐**\n\n请输入套餐名称:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]]), parse_mode='Markdown')
+    await send_or_edit_menu(update, context, "📝 **步骤 1/6：开始添加套餐**\n\n请输入套餐名称:",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消", callback_data="cancel_op")]]))
+
+
+SAFE_PREWRITE_FAILURES = frozenset({
+    'legacy_subscription_requires_id_migration',
+    'reason:business_validation|plan_deleted',
+    'panel_configuration_incomplete',
+    'reason:business_validation|missing_target_uuid',
+    'user_not_found',
+})
+
+
+def safe_to_retry_order(order):
+    """Only failures known to precede every Panel write may return to pending."""
+    return (order.get('status') == STATUS_FAILED
+            and order.get('error_message') in SAFE_PREWRITE_FAILURES)
+
 
 async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3129,8 +3146,28 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     data = query.data
+    order_id_for_log = (data.split('_', 3)[3] if data.startswith('order_cancel_')
+                        else data.split('_', 2)[1] if '_' in data else '-')
+    action = ('cancel' if data.startswith('order_cancel_') else data.split('_', 1)[0])
+    initial_order = get_order(db_query, order_id_for_log)
+    previous_status = initial_order.get('status') if initial_order else 'missing'
+    message_kind = callback_message_kind(getattr(query, 'message', None))
     client_return_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]])
     admin_return_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]])
+    async def update_ui(content, reply_markup=None):
+        current = get_order(db_query, order_id_for_log)
+        try:
+            method = await edit_callback_message(query, context.bot, ADMIN_ID, content,
+                                                 reply_markup=reply_markup)
+            logger.info('order review ui order_id=%s action=%s previous_status=%s resulting_status=%s kind=%s method=%s',
+                        order_id_for_log, action, previous_status,
+                        current.get('status') if current else 'missing',
+                        message_kind, method)
+        except TelegramError as exc:
+            logger.warning('order review ui failed order_id=%s action=%s previous_status=%s resulting_status=%s kind=%s exception=%s',
+                           order_id_for_log, action, previous_status,
+                           current.get('status') if current else 'missing',
+                           message_kind, type(exc).__name__)
     async def clean_user_waiting_msg(order_record):
         uid = int(order_record.get('tg_id', 0) or 0)
         waiting_message_id = order_record.get('waiting_message_id')
@@ -3150,40 +3187,53 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (int(time.time()), order_record.get('order_id')),
         )
     if data.startswith("review_"):
-        parts = data.split("_")
-        if len(parts) >= 5:
-            uid = parts[1]
-            plan_key = parts[2]
-            order_type = parts[3]
-            sid = parts[4]
-            kb = [
-                [InlineKeyboardButton("✅ 通过", callback_data=f"ap_{uid}_{plan_key}_{order_type}_{sid}")],
-                [InlineKeyboardButton("❌ 拒绝", callback_data=f"rj_{uid}_{plan_key}_{order_type}_{sid}")]
-            ]
-            await query.edit_message_text("🧾 已重新进入审核，请选择操作：", reply_markup=InlineKeyboardMarkup(kb))
+        await update_ui("🔎 请在订单审计中核对当前状态。", reply_markup=admin_return_btn)
+        return
+    if data.startswith("order_cancel_confirm_") or data.startswith("order_cancel_yes_"):
+        order_id = data.split('order_cancel_', 1)[1].split('_', 1)[1]
+        order_id_for_log = order_id
+        order = get_order(db_query, order_id)
+        allowed = bool(order and (order['status'] == STATUS_PENDING or safe_to_retry_order(order)))
+        if not allowed:
+            await update_ui("⚠️ 当前订单不能安全取消，请核对实际处理结果。", admin_return_btn)
+            return
+        if data.startswith("order_cancel_confirm_"):
+            await update_ui(f"⚠️ 确认取消订单 {order_id}？", InlineKeyboardMarkup([
+                [InlineKeyboardButton("确认取消", callback_data=f"order_cancel_yes_{order_id}")],
+                [InlineKeyboardButton("返回订单", callback_data=f"admin_order_{order_id}")],
+            ]))
+            return
+        if update_order_status(db_execute, order_id, [order['status']], STATUS_REJECTED,
+                               error_message='cancelled_by_admin'):
+            append_order_audit_log(db_execute, order_id, 'cancel', query.from_user.id, 'admin_cancelled')
+            await update_ui("🚫 订单已取消。", admin_return_btn)
+            await clean_user_waiting_msg(order)
+            try:
+                await context.bot.send_message(int(order['tg_id']), "🚫 您的订单已由管理员取消。",
+                                               reply_markup=client_return_btn)
+            except TelegramError as exc:
+                logger.warning('order cancel notice failed order_id=%s exception=%s',
+                               order_id, type(exc).__name__)
         else:
-            await query.edit_message_text("⚠️ 订单数据不完整，无法重新审核。", reply_markup=admin_return_btn)
+            await update_ui("⚠️ 订单状态已变化，请重新核对。", admin_return_btn)
         return
     if data.startswith("rj_"):
         parts = data.split("_")
         order_id = parts[1]
         order = get_order(db_query, order_id)
         if not order:
-            await query.edit_message_text("⚠️ 订单不存在", reply_markup=admin_return_btn)
+            await update_ui("⚠️ 订单不存在", reply_markup=admin_return_btn)
             return
         if order['status'] != STATUS_PENDING:
-            await query.edit_message_text("⚠️ 订单已进入处理或终态，不能再拒绝；请先核对状态。", reply_markup=admin_return_btn)
+            await update_ui("⚠️ 订单已进入处理或终态，不能再拒绝；请先核对状态。", reply_markup=admin_return_btn)
             return
         uid = int(order['tg_id'])
-        retry_markup = admin_return_btn
-        if len(parts) >= 5:
-            retry_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧾 再次审核", callback_data=f"review_{parts[1]}_{parts[2]}_{parts[3]}_{parts[4]}")],
-                [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_home")]
-            ])
-        update_order_status(db_execute, order_id, [STATUS_PENDING], STATUS_REJECTED, error_message='rejected_by_admin')
+        if not update_order_status(db_execute, order_id, [STATUS_PENDING], STATUS_REJECTED,
+                                   error_message='rejected_by_admin'):
+            await update_ui("⚠️ 订单状态已变化，请重新核对。", admin_return_btn)
+            return
         append_order_audit_log(db_execute, order_id, 'reject', query.from_user.id, 'admin_rejected')
-        await query.edit_message_text("❌ 已拒绝", reply_markup=retry_markup)
+        await update_ui("❌ 已拒绝", reply_markup=admin_return_btn)
         await clean_user_waiting_msg(order)
         try:
             await context.bot.send_message(uid, "❌ 您的订单已被管理员拒绝。", reply_markup=client_return_btn)
@@ -3195,16 +3245,16 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = data.split("_", 1)[1]
         order = get_order(db_query, order_id)
         if not order:
-            await query.edit_message_text("⚠️ 订单不存在", reply_markup=admin_return_btn)
+            await update_ui("⚠️ 订单不存在", reply_markup=admin_return_btn)
             return
-        if order.get('status') != STATUS_FAILED:
-            await query.edit_message_text("⚠️ 仅允许重试失败订单", reply_markup=admin_return_btn)
+        if not safe_to_retry_order(order):
+            await update_ui("⚠️ 无法证明 Panel 写操作尚未执行，禁止重试；请重新核对。", reply_markup=admin_return_btn)
             return
         switched = update_order_status(db_execute, order_id, [STATUS_FAILED], STATUS_PENDING, error_message='retry_by_admin')
-        append_order_audit_log(db_execute, order_id, 'retry', query.from_user.id, 'retry_by_admin')
         if not switched:
-            await query.edit_message_text("⚠️ 订单状态更新失败，请重试", reply_markup=admin_return_btn)
+            await update_ui("⚠️ 订单状态更新失败，请重试", reply_markup=admin_return_btn)
             return
+        append_order_audit_log(db_execute, order_id, 'retry', query.from_user.id, 'retry_by_admin')
         sid = "0"
         if order.get('target_user_id'):
             sid = get_short_id(order['target_user_id'])
@@ -3216,20 +3266,20 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, order_id, short_id = data.split("_", 2)
     order = get_order(db_query, order_id)
     if not order:
-        await query.edit_message_text("⚠️ 订单不存在或已过期", reply_markup=admin_return_btn)
+        await update_ui("⚠️ 订单不存在或已过期", reply_markup=admin_return_btn)
         return
 
     if order.get('status') == STATUS_DELIVERED:
-        await query.edit_message_text("ℹ️ 该订单已发货（幂等保护）", reply_markup=admin_return_btn)
+        await update_ui("ℹ️ 该订单已发货（幂等保护）", reply_markup=admin_return_btn)
         return
 
     if order.get('status') != STATUS_PENDING:
-        await query.edit_message_text(f"⚠️ 当前订单状态不可处理: {order.get('status')}", reply_markup=admin_return_btn)
+        await update_ui(f"⚠️ 当前订单状态不可处理: {order.get('status')}", reply_markup=admin_return_btn)
         return
 
     claimed = update_order_status(db_execute, order_id, [STATUS_PENDING], STATUS_APPROVED)
     if not claimed:
-        await query.edit_message_text("⚠️ 订单正在被其他操作处理，请稍后重试", reply_markup=admin_return_btn)
+        await update_ui("⚠️ 订单正在被其他操作处理，请稍后重试", reply_markup=admin_return_btn)
         return
 
     uid = order['tg_id']
@@ -3239,22 +3289,22 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if order_type == 'renew' and not target_user_id:
         update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED,
                             error_message='legacy_subscription_requires_id_migration')
-        await query.edit_message_text("⚠️ 旧订阅尚未完成数值用户 ID 迁移，请先联系管理员绑定。", reply_markup=admin_return_btn)
+        await update_ui("⚠️ 旧订阅尚未完成数值用户 ID 迁移，请先联系管理员绑定。", reply_markup=admin_return_btn)
         return
 
     plan = db_query("SELECT * FROM plans WHERE key = ?", (plan_key,), one=True)
     if not plan:
         update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:business_validation|plan_deleted')
-        await query.edit_message_text("❌ 套餐已删除", reply_markup=admin_return_btn)
+        await update_ui("❌ 套餐已删除", reply_markup=admin_return_btn)
         return
 
     if not panel_config_ready() or (order_type == 'new' and not TARGET_GROUP_UUID):
         update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED,
                             error_message='panel_configuration_incomplete')
-        await query.edit_message_text("⚠️ 面板地址、Token 或新购所需默认内部组尚未配置。", reply_markup=admin_return_btn)
+        await update_ui("⚠️ 面板地址、Token 或新购所需默认内部组尚未配置。", reply_markup=admin_return_btn)
         return
 
-    await query.edit_message_text("🔄 处理中...")
+    await update_ui("🔄 处理中...")
     plan_dict = dict(plan)
     add_traffic = plan_dict['gb'] * 1024 * 1024 * 1024
     add_days = plan_dict['days']
@@ -3262,18 +3312,19 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     strategy_label = get_strategy_label(reset_strategy)
 
     extension_started = False
+    creation_started = False
     try:
         if order_type == 'renew':
             if not target_user_id:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:business_validation|missing_target_uuid')
-                await query.edit_message_text("⚠️ 订单数据已过期", reply_markup=admin_return_btn)
+                await update_ui("⚠️ 订单数据已过期", reply_markup=admin_return_btn)
                 return
             if not owned_subscription(uid, int(target_user_id)):
                 raise ValueError('续费目标已不属于该 Telegram 用户')
             user_info = await get_panel_user(target_user_id)
             if not user_info:
                 update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='user_not_found')
-                await query.edit_message_text("⚠️ 用户不存在", reply_markup=admin_return_btn)
+                await update_ui("⚠️ 用户不存在", reply_markup=admin_return_btn)
                 return
             if user_info.get('telegramId') not in (None, int(uid)):
                 raise ValueError('Panel 用户绑定与续费订单不一致')
@@ -3307,7 +3358,7 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await sync_user_metadata(target_user_id, uid, plan_key=plan_key, order_id=order_id)
                 except Exception as exc:
                     logger.warning('renewal metadata sync failed for order %s: %s', order_id, type(exc).__name__)
-                await query.edit_message_text(f"✅ 续费成功\n用户: {uid}", reply_markup=admin_return_btn)
+                await update_ui(f"✅ 续费成功\n用户: {uid}", reply_markup=admin_return_btn)
                 await clean_user_waiting_msg(order)
                 await send_subscription_card(context, uid, refreshed, target_user_id)
             else:
@@ -3328,7 +3379,12 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "expireAt": expire_iso,
                 "activeInternalSquads": [TARGET_GROUP_UUID],
             }
-            r = None if existing_panel_user else await create_panel_user(payload)
+            if existing_panel_user:
+                r = None
+            else:
+                # A lost response does not prove that a non-idempotent create failed.
+                creation_started = True
+                r = await create_panel_user(payload)
             if existing_panel_user or (r and r.status_code == 201):
                 resp_data = existing_panel_user or extract_payload(r)
                 panel_user_id = resp_data.get('id')
@@ -3340,10 +3396,16 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "INSERT INTO subscriptions (tg_id, user_id, migration_status, created_at, plan_key) VALUES (?, ?, 'resolved', ?, ?)",
                         (uid, panel_user_id, int(time.time()), plan_key),
                     )
-                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED, delivered_user_id=panel_user_id)
+                if not update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_DELIVERED,
+                                           delivered_user_id=panel_user_id):
+                    raise RuntimeError('Could not persist delivered new-order state')
                 append_order_audit_log(db_execute, order_id, 'deliver_success', query.from_user.id, 'new')
-                await sync_user_metadata(panel_user_id, uid, plan_key=plan_key, order_id=order_id)
-                await query.edit_message_text(f"✅ 开通成功\n用户: {uid}", reply_markup=admin_return_btn)
+                try:
+                    await sync_user_metadata(panel_user_id, uid, plan_key=plan_key, order_id=order_id)
+                except Exception as exc:
+                    logger.warning('new-order metadata sync failed order_id=%s exception=%s',
+                                   order_id, type(exc).__name__)
+                await update_ui(f"✅ 开通成功\n用户: {uid}", reply_markup=admin_return_btn)
                 sub_url = resp_data['subscriptionUrl']
                 display_expire = format_time(expire_iso)
                 msg = (
@@ -3360,20 +3422,27 @@ async def process_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.send_message(uid, msg, parse_mode='MarkdownV2', reply_markup=client_return_btn)
             else:
-                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message='reason:network|panel_api_error_new')
-                await query.edit_message_text("❌ 失败", reply_markup=admin_return_btn)
+                update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_UNKNOWN,
+                                    error_message='reason:network|create_result_unconfirmed')
+                await update_ui("⚠️ 创建结果待核对，禁止重复审核。", reply_markup=admin_return_btn)
     except Exception as exc:
-        logger.exception("Order processing failed for %s", order_id)
+        current = get_order(db_query, order_id)
+        if current and current['status'] == STATUS_DELIVERED:
+            logger.warning('order delivered but follow-up failed order_id=%s exception=%s',
+                           order_id, type(exc).__name__)
+            await update_ui("✅ 订单已发货；后续通知可能失败，请核对。", reply_markup=admin_return_btn)
+            return
+        logger.error("Order processing failed order_id=%s exception=%s", order_id, type(exc).__name__)
         reason = classify_order_failure(str(exc))
-        detail = f"reason:{reason}|{str(exc)[:320]}"
-        if order_type == 'renew' and extension_started:
+        detail = f"reason:{reason}|{type(exc).__name__}"
+        if (order_type == 'renew' and extension_started) or (order_type == 'new' and creation_started):
             update_order_status(db_execute, order_id, [STATUS_APPROVED, STATUS_EXTENSION_APPLIED],
                                 STATUS_UNKNOWN, error_message=detail)
         else:
             update_order_status(db_execute, order_id, [STATUS_APPROVED], STATUS_FAILED, error_message=detail)
         append_order_audit_log(db_execute, order_id, 'deliver_failed', query.from_user.id, detail)
-        await query.edit_message_text(
-            '⚠️ 续期结果不确定，请人工核对面板，禁止重复审核。' if order_type == 'renew' and extension_started
+        await update_ui(
+            '⚠️ Panel 写入结果不确定，请人工核对，禁止重复审核。' if extension_started or creation_started
             else '❌ 订单处理失败，请查看服务日志。', reply_markup=admin_return_btn)
 
 async def process_bulk_jobs_job(context: ContextTypes.DEFAULT_TYPE):
@@ -3694,6 +3763,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^set_anomaly_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^admin_orders_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^admin_order_"))
+    app.add_handler(CallbackQueryHandler(process_order, pattern="^order_cancel_(confirm|yes)_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^panelcfg_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^anomaly_whitelist_"))
     app.add_handler(CallbackQueryHandler(admin_menu_handler, pattern="^anomaly_quick_"))
@@ -3712,7 +3782,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^contact_support$"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^client_nodes$"))
     app.add_handler(CallbackQueryHandler(client_menu_handler, pattern="^view_sub_"))
-    app.add_handler(CallbackQueryHandler(process_order, pattern="^(ap|rj|review)_"))
+    app.add_handler(CallbackQueryHandler(process_order, pattern="^(ap|rj|review|rt)_"))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message))
     app.add_error_handler(telegram_error_handler)
     

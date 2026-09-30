@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from services.panel_api import PanelApiError
+from telegram.error import BadRequest
+from handlers.telegram_ui import edit_callback_message
 from storage.db import (create_action_request, db_execute, db_query, get_action_request,
                         init_db)
 
@@ -35,8 +37,11 @@ class TestV38Business(unittest.IsolatedAsyncioTestCase):
         self.db_patch = patch.object(self.bot, 'DB_FILE', self.db)
         self.db_patch.start()
         self.query = SimpleNamespace(data='ap_order1_42', from_user=SimpleNamespace(id=123),
-                                     answer=AsyncMock(), edit_message_text=AsyncMock())
-        self.update = SimpleNamespace(callback_query=self.query)
+                                     message=SimpleNamespace(text='order', photo=None, document=None),
+                                     answer=AsyncMock(), edit_message_text=AsyncMock(),
+                                     edit_message_caption=AsyncMock(), edit_message_reply_markup=AsyncMock(),
+                                     delete_message=AsyncMock())
+        self.update = SimpleNamespace(callback_query=self.query, effective_chat=SimpleNamespace(id=123))
         self.context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(),
                                                            send_photo=AsyncMock(), delete_message=AsyncMock()),
                                        user_data={})
@@ -84,6 +89,156 @@ class TestV38Business(unittest.IsolatedAsyncioTestCase):
             'id': 42, 'trafficLimitBytes': refreshed['trafficLimitBytes'],
             'trafficLimitStrategy': 'NO_RESET'})
         card.assert_awaited_once_with(self.context, 777, refreshed, 42)
+        self.query.edit_message_text.assert_awaited()
+        self.query.edit_message_caption.assert_not_awaited()
+
+    async def test_new_photo_order_approve_only_creates_once(self):
+        now = int(time.time())
+        db_execute(self.db, "INSERT OR REPLACE INTO plans (key,name,days,gb,reset_strategy) VALUES (?,?,?,?,?)",
+                   ('p1', 'Plan', 30, 10, 'NO_RESET'))
+        db_execute(self.db, """INSERT INTO orders
+                   (order_id,tg_id,plan_key,order_type,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?)""", ('order1', 777, 'p1', 'new', 'pending', now, now))
+        self.query.data = 'ap_order1_0'
+        self.query.message = SimpleNamespace(text=None, photo=['proof'], document=None, caption='proof')
+        create = AsyncMock(return_value=SimpleNamespace(status_code=201))
+        with patch.object(self.bot, 'panel_config_ready', return_value=True), \
+             patch.object(self.bot, 'TARGET_GROUP_UUID', 'group'), \
+             patch.object(self.bot, 'get_user_by_username', new=AsyncMock(return_value=None)), \
+             patch.object(self.bot, 'create_panel_user', new=create), \
+             patch.object(self.bot, 'extract_payload', return_value={'id': 42, 'subscriptionUrl': 'https://example.test/sub'}), \
+             patch.object(self.bot, 'sync_user_metadata', new=AsyncMock()), \
+             patch.object(self.bot, 'generate_qr', return_value=b'qr'):
+            await self.bot.process_order(self.update, self.context)
+            await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'delivered')
+        create.assert_awaited_once()
+        self.query.edit_message_text.assert_not_awaited()
+        self.query.edit_message_caption.assert_awaited()
+
+    async def test_media_order_approve_and_duplicate_are_caption_aware(self):
+        for kind in ('photo', 'document'):
+            with self.subTest(kind=kind):
+                self.seed_renewal()
+                self.query.message = SimpleNamespace(text=None, photo=['proof'] if kind == 'photo' else None,
+                                                     document='proof' if kind == 'document' else None,
+                                                     caption='payment proof')
+                before = {'id': 42, 'telegramId': 777, 'trafficLimitBytes': 100}
+                extend = AsyncMock(return_value=before)
+                with patch.object(self.bot, 'panel_config_ready', return_value=True), \
+                     patch.object(self.bot, 'get_panel_user', new=AsyncMock(side_effect=[before, before])), \
+                     patch.object(self.bot, 'extend_subscription', new=extend), \
+                     patch.object(self.bot, 'patch_panel_user', new=AsyncMock(return_value=SimpleNamespace(status_code=200))), \
+                     patch.object(self.bot, 'sync_user_metadata', new=AsyncMock()), \
+                     patch.object(self.bot, 'send_subscription_card', new=AsyncMock()):
+                    await self.bot.process_order(self.update, self.context)
+                    await self.bot.process_order(self.update, self.context)
+                    self.query.data = 'rj_order1'
+                    await self.bot.process_order(self.update, self.context)
+                self.assertEqual(self.order_status(), 'delivered')
+                extend.assert_awaited_once()
+                self.assertGreaterEqual(self.query.edit_message_caption.await_count, 2)
+                self.query.edit_message_text.assert_not_awaited()
+                db_execute(self.db, "DELETE FROM orders WHERE order_id='order1'")
+                db_execute(self.db, "DELETE FROM subscriptions WHERE user_id=42")
+                db_execute(self.db, "DELETE FROM plans WHERE key='p1'")
+                self.query.data = 'ap_order1_42'
+                self.query.edit_message_caption.reset_mock()
+
+    async def test_media_reject_and_cross_click_preserve_rejected(self):
+        self.seed_renewal()
+        self.query.data = 'rj_order1'
+        self.query.message = SimpleNamespace(text=None, photo=['proof'], document=None, caption=None)
+        await self.bot.process_order(self.update, self.context)
+        await self.bot.process_order(self.update, self.context)
+        self.query.data = 'ap_order1_42'
+        await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'rejected')
+        self.query.edit_message_text.assert_not_awaited()
+        self.assertEqual(self.query.edit_message_caption.await_count, 3)
+
+    async def test_text_reject_and_cross_click_use_text_edit(self):
+        self.seed_renewal()
+        self.query.data = 'rj_order1'
+        await self.bot.process_order(self.update, self.context)
+        self.query.data = 'ap_order1_42'
+        await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'rejected')
+        self.assertEqual(self.query.edit_message_text.await_count, 2)
+        self.query.edit_message_caption.assert_not_awaited()
+
+    async def test_caption_limit_fallback_clears_keyboard(self):
+        self.query.message = SimpleNamespace(text=None, photo=['proof'], document=None, caption=None)
+        result = await edit_callback_message(self.query, self.context.bot, 123, 'x' * 1025)
+        self.assertEqual(result, 'fallback')
+        self.query.edit_message_caption.assert_not_awaited()
+        self.query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        self.context.bot.send_message.assert_awaited_once()
+
+    async def test_caption_bad_request_fallback_and_stale_keyboard(self):
+        self.query.message = SimpleNamespace(text=None, photo=['proof'], document=None, caption='proof')
+        self.query.edit_message_caption.side_effect = BadRequest("Message can't be edited")
+        self.query.edit_message_reply_markup.side_effect = BadRequest("Message can't be edited")
+        self.query.delete_message.side_effect = BadRequest("Message can't be deleted")
+        result = await edit_callback_message(self.query, self.context.bot, 123, 'result')
+        self.assertEqual(result, 'fallback')
+        self.assertIn('原卡片按钮无法移除', self.context.bot.send_message.await_args.kwargs['text'])
+
+    async def test_unsafe_failed_order_cannot_retry_or_cancel(self):
+        self.seed_renewal()
+        db_execute(self.db, "UPDATE orders SET status='failed', error_message='reason:network|PanelApiError' WHERE order_id='order1'")
+        self.query.data = 'rt_order1'
+        await self.bot.process_order(self.update, self.context)
+        self.query.data = 'order_cancel_yes_order1'
+        await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'failed')
+
+    async def test_safe_failed_order_cancel_requires_confirmation(self):
+        self.seed_renewal()
+        db_execute(self.db, "UPDATE orders SET status='failed', error_message='panel_configuration_incomplete' WHERE order_id='order1'")
+        self.query.data = 'order_cancel_confirm_order1'
+        await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'failed')
+        self.query.data = 'order_cancel_yes_order1'
+        await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'rejected')
+
+    async def test_ui_edit_failure_does_not_interrupt_renewal(self):
+        self.seed_renewal()
+        self.query.message = SimpleNamespace(text=None, photo=['proof'], document=None, caption='proof')
+        self.query.edit_message_caption.side_effect = BadRequest("Message can't be edited")
+        before = {'id': 42, 'telegramId': 777, 'trafficLimitBytes': 100}
+        extend = AsyncMock(return_value=before)
+        with patch.object(self.bot, 'panel_config_ready', return_value=True), \
+             patch.object(self.bot, 'get_panel_user', new=AsyncMock(side_effect=[before, before])), \
+             patch.object(self.bot, 'extend_subscription', new=extend), \
+             patch.object(self.bot, 'patch_panel_user', new=AsyncMock(return_value=SimpleNamespace(status_code=200))), \
+             patch.object(self.bot, 'sync_user_metadata', new=AsyncMock()), \
+             patch.object(self.bot, 'send_subscription_card', new=AsyncMock()):
+            await self.bot.process_order(self.update, self.context)
+            await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'delivered')
+        extend.assert_awaited_once()
+        self.query.edit_message_reply_markup.assert_awaited()
+        self.context.bot.send_message.assert_awaited()
+
+    async def test_new_order_create_timeout_is_unknown_and_not_retried(self):
+        now = int(time.time())
+        db_execute(self.db, "INSERT OR REPLACE INTO plans (key,name,days,gb,reset_strategy) VALUES (?,?,?,?,?)",
+                   ('p1', 'Plan', 30, 10, 'NO_RESET'))
+        db_execute(self.db, """INSERT INTO orders
+                   (order_id,tg_id,plan_key,order_type,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?)""", ('order1', 777, 'p1', 'new', 'pending', now, now))
+        self.query.data = 'ap_order1_0'
+        create = AsyncMock(side_effect=PanelApiError('timeout'))
+        with patch.object(self.bot, 'panel_config_ready', return_value=True), \
+             patch.object(self.bot, 'TARGET_GROUP_UUID', 'group'), \
+             patch.object(self.bot, 'get_user_by_username', new=AsyncMock(return_value=None)), \
+             patch.object(self.bot, 'create_panel_user', new=create):
+            await self.bot.process_order(self.update, self.context)
+            await self.bot.process_order(self.update, self.context)
+        self.assertEqual(self.order_status(), 'unknown')
+        create.assert_awaited_once()
 
     async def test_renewal_timeout_and_patch_failure_are_unknown(self):
         for fail_at in ('extend', 'patch'):
@@ -171,5 +326,11 @@ class TestV38Business(unittest.IsolatedAsyncioTestCase):
     def test_restart_marks_inflight_writes_unknown(self):
         self.seed_renewal()
         db_execute(self.db, "UPDATE orders SET status='extension_applied' WHERE order_id='order1'")
+        init_db(self.db)
+        self.assertEqual(self.order_status(), 'unknown')
+
+    def test_restart_marks_new_approval_unknown(self):
+        self.seed_renewal()
+        db_execute(self.db, "UPDATE orders SET order_type='new', status='approved' WHERE order_id='order1'")
         init_db(self.db)
         self.assertEqual(self.order_status(), 'unknown')

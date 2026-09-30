@@ -133,7 +133,7 @@ def _init_db_on_connection(conn: sqlite3.Connection) -> None:
 
     # A resumed approval or destructive callback may already have reached Panel.
     # Preserve the record for manual review instead of replaying the write.
-    c.execute("UPDATE orders SET status='unknown' WHERE order_type='renew' AND status IN ('approved','extension_applied')")
+    c.execute("UPDATE orders SET status='unknown' WHERE status='approved' OR (order_type='renew' AND status='extension_applied')")
     c.execute('''CREATE TABLE IF NOT EXISTS action_requests (
         id TEXT PRIMARY KEY,
         tg_id INTEGER NOT NULL,
